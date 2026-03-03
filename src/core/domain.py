@@ -33,14 +33,7 @@ class ScalarDomain(eqx.Module):
 
     ne_0: jnp.float32
 
-    Bmax: jnp.float32
-
-    Te_min: jnp.float32
-
     inv_brems: bool
-    phaseshift: bool
-    opacity: bool
-    B_on: bool
     edensity: bool
 
     probing_direction: str
@@ -73,10 +66,6 @@ class ScalarDomain(eqx.Module):
 
     ne: jax.Array
 
-    B: jax.Array
-    Te: np.array
-    Z: jax.Array
-  
     region_count: jnp.int32
 
     coord_backup: jax.Array
@@ -90,14 +79,10 @@ class ScalarDomain(eqx.Module):
     Np_total: np.int64
     ray_batch_count: np.int64
 
-    opacity_files: list
-    densities: list
-    num_materials: jnp.int32
-
     refrac_field: jax.Array
 
-    def __init__(self, lengths, dims, *, ne_type = None, inv_brems = False, opacity = False, phaseshift = False, B_on = False, probing_direction = 'z', auto_batching = True, iteration = 1, region_count = 1, leeway_factor = None, coord_backup = None, future_dims = None, extra_info = False, memory_reporting = False, memory_limit = None, Np = None,
-        s = None, s1 = None, s2 = None, Ly = None, ne_0 = None, ne = None, B = None, Bmax = None, Te = None, Te_min = None, Z = None, opacity_files = None, densities = None, num_materials = None, edensity = True, refrac_field = None):
+    def __init__(self, lengths, dims, *, ne_type = None, inv_brems = False, probing_direction = 'z', auto_batching = True, iteration = 1, region_count = 1, leeway_factor = None, coord_backup = None, future_dims = None, extra_info = False, memory_reporting = False, memory_limit = None, Np = None,
+        s = None, s1 = None, s2 = None, Ly = None, ne_0 = None, ne = None, edensity = True, refrac_field = None):
         """
         A class to set-up/generate the scalar simulation domains and store for later use.
 
@@ -113,15 +98,6 @@ class ScalarDomain(eqx.Module):
 
         :param inv_brems: Disables python multithreading to prevent conflict with jax parallelisation in some instances.
         :type inv_brems: bool (default = True)
-
-        :param opacity:
-        :type opacity:
-
-        :param phaseshift: Enable 64-bit values in jax (double precision floating point arithmetic).
-        :type phaseshift: bool (default = False)
-
-        :param B_on: Enables debug flags, increases runtime.
-        :type B_on: bool (default = False)
 
         :param probing_direction: Set's the direction the beam is propagating in.
         :type probing_direction: char (default = 'z')
@@ -156,8 +132,8 @@ class ScalarDomain(eqx.Module):
         :param Np: The total number of rays to be simulated - needs to be set if intending to batch ray generation.
         :type Np: int, default: None
 
-        + plus an assortment of paramters for domain generation that can be set to override defaults
-            (s, s1, s2, Ly, ne_0, ne, B, Bmax, Te, Te_min, Z)
+        + plus an assortment of parameters for domain generation that can be set to override defaults
+            (s, s1, s2, Ly, ne_0, ne)
 
         :raise Exception: If lengths or dims are an array of len(...) != 1 but not len(...) == 3
         :raise AssertionError: If ne_type is changed from the default but not set to a valid type.
@@ -174,12 +150,6 @@ class ScalarDomain(eqx.Module):
         # Logical switches
         self.inv_brems = inv_brems
         del inv_brems
-        self.opacity = opacity
-        del opacity
-        self.phaseshift = phaseshift
-        del phaseshift
-        self.B_on = B_on
-        del B_on
         self.edensity = edensity
         del edensity
 
@@ -202,25 +172,6 @@ class ScalarDomain(eqx.Module):
         self.ne = ne
         del ne
 
-        self.B = B
-        del B
-
-        self.Bmax = Bmax
-        del Bmax
-
-        self.Te_min = Te_min
-        del Te_min
-
-        if self.Te_min is not None and Te is not None:
-            self.Te = jnp.maximum(self.Te_min, Te)
-        else:
-            self.Te = Te
-
-        del Te
-
-        self.Z = Z
-        del Z
-
         if self.edensity == True and refrac_field is not None:
             print(colour.BOLD + "\nBy setting edensity == True, refrac_field will not be used. If this is intended, we suggest you do not pass this value in future." + colour.END)
             print(" --> Overriding self.refrac_field entry to None")
@@ -229,15 +180,6 @@ class ScalarDomain(eqx.Module):
         else:
             self.refrac_field = refrac_field
         del refrac_field
-
-        self.opacity_files = opacity_files
-        del opacity_files
-
-        self.densities = densities
-        del densities
-
-        self.num_materials = num_materials
-        del num_materials
 
         self.probing_direction = probing_direction
 
@@ -305,9 +247,6 @@ class ScalarDomain(eqx.Module):
         ### Explains the override in propagator, but does this functionality make sense?
         ###
 
-        if self.opacity:
-            self.inv_brems = False
-
         # changed function to pass to np.int64 to prevent overflow - this was causing the negatives
         # --> (exactly 0 in the case of a 1024^3 domain as it is right on the limit)
         predicted_domain_allocation = domain_estimate(self.x_n, self.y_n, self.z_n)
@@ -336,16 +275,10 @@ class ScalarDomain(eqx.Module):
             allocation_count = 2
 
             # up to +5 in calc_dndr(...) depending on the number of extra interps
-            if self.B_on:
-                # there are 4 B based interps
-                # and they also require a ScalarDomain.B domain sized matrice
-                allocation_count += 4
             if self.inv_brems:
                 # unsure how many intermediaries exist at peak mem usage for this allocation - need to check and adjust this
                 allocation_count += 1
-            if self.phaseshift:
-                allocation_count += 1
-
+                
             # compare to max allocation in domain setup and return the greatest
             if self.ne_type == "test_null" or self.ne_type == "test_slab" or self.ne_type == "test_B":
                 allocation_count = max(allocation_count, 2)
@@ -563,15 +496,6 @@ class ScalarDomain(eqx.Module):
 
                 print("\n --> future dims: {}".format(self.future_dims))
 
-        '''
-        if B_on:
-            self.B = jnp.array
-        else:
-            self.B = None
-
-        etc...
-        '''
-
     #@partial(jax.jit, static_argnames=("self",))  
     def generate_electron_density_profile(self):
         """
@@ -617,14 +541,6 @@ class ScalarDomain(eqx.Module):
             self.ZZ = None
 
             self.test_exponential_cos()
-        elif self.ne_type == "test_B":
-            print("testB field...")
-            self.XX, _, _ = jnp.meshgrid(self.x, self.y, self.z, indexing = 'ij', copy = True)
-
-            self.YY = None
-            self.ZZ = None
-
-            self.test_B()
         elif self.ne_type == "import":
             print("pre-generated ne field is auto-imported if passed (not None)...")
         else:
@@ -765,89 +681,7 @@ class ScalarDomain(eqx.Module):
 
         self.ne = self.ne.at[:, :, :].set(self.ne)
 
-    '''
-    #@partial(jax.jit, static_argnames=("self",))  
-    def external_B(self):
-        """
-        Load externally generated MxMxMx3 grid of B field in T
-
-        :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
-
-        :return: No return, loads domain as an attribute to the self referenced object.
-        :rtype: None
-        """
-
-        self.B = self.B.at[:, :, :, :].set(B)
-
-    #@partial(jax.jit, static_argnames=("self",))  
-    def external_Te(self, *, Te, Te_min = 1.0):
-        """
-        Load externally generated MxMxM grid of electron temperature in eV
-
-        :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
-
-        :param Te: MxMxM grid of electron temperature in eV
-        :type Te: jax.Array or numpy.array of shape M^3
-
-        :param Te_min: Set the minimum temperature of the grid
-        :type Te_min: float, default: 1.0
-
-        :return: No return, loads domain as an attribute to the self referenced object.
-        :rtype: None
-        """
-
-        self.Te = self.Te.at[:, :, :].set(jnp.maximum(Te_min, Te))
-
-    #@partial(jax.jit, static_argnames=("self",))  
-    def external_Z(self, *, Z):
-        """
-        Load externally generated grid
-
-        Args:
-            Z ([type]): MxMxM grid of ionisation
-        """
-        """
-        Load externally generated MxMxM grid of electron temperature in eV
-
-        :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
-
-        :param Te: MxMxM grid of electron temperature in eV
-        :type Te: jax.Array or numpy.array of shape M^3
-
-        :param Te_min: Set the minimum temperature of the grid
-        :type Te_min: float, default: 1.0
-
-        :return: No return, loads domain as an attribute to the self referenced object.
-        :rtype: None
-        """
-
-        self.Z = self.Z.at[:, :, :].set(Z)
-    '''
-
-    #@partial(jax.jit, static_argnames=("self",))  
-    def test_B(self, *, Bmax = 1.0):
-        """
-        Generate a Bz field with a linear gradient in x: Bz =  Bmax * x / extent
-
-        :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
-
-        :param Bmax: Limiting max value B field in a cell
-        :type Te: float, default: 1.0 T [Tesla]
-
-        :return: No return, loads domain as an attribute to the self referenced object.
-        :rtype: None
-        """
-
-        if self.Bmax is not None:
-            Bmax = self.Bmax
-
-        self.B = self.B.at[:, :, :, :].set(jnp.zeros(jnp.append(jnp.array(self.XX.shape), 3)))
-        self.B = self.B.at[:, :, :, 2].set(Bmax * self.XX / self.x_length)
-
+    #@partial(jax.jit, static_argnames=("self",))
     def export_scalar_field(self, property: str = 'ne', fname: str = None):
         """
         Export the current scalar electron density profile as a pvti file format, property added for future scalability to export temperature, B-field, etc.
