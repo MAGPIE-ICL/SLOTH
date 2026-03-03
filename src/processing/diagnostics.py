@@ -1,0 +1,658 @@
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+import numpy as np
+import jax.numpy as jnp
+from sympy import Matrix
+
+import simulator.fresnel_integral as fresnel_integral
+
+from shared.propagation import ray_to_Jonesvector
+
+from shared.utils import count_nans
+from shared.utils import round_to_n
+
+#import jax
+#jax.tree_util.tree_leaves(x, is_leaf = lambda x: x is None)
+
+"""
+(rtm_solver)
+Ray Transfer Matrix Solver - Modified from Jack Hare's Version
+Example:
+
+###INITIALISE RAYS###
+#Rays are a 4 vector of x, theta, y, phi - 6 vector (E_x and E_y added) if E field is taken into account in solver
+#here we initialise 10*7 randomly distributed rays
+rr0=jnp.random.rand(6,int(1e7))
+rr0[0,:]-= 0.5 #rand generates [0,1], so we recentre [-0.5,0.5]
+rr0[2,:]-= 0.5
+
+rr0[4,:]-= 0.5 #rand generates [0,1], so we recentre [-0.5,0.5]
+rr0[5,:]-= 0.5
+
+#x, θ, y, ϕ
+scales=jnp.diag(jnp.asarray([10, 0, 10, 0, 1, 1j])) #set angles to 0, collimated beam. x, y in [-5,5]. Circularly polarised beam, E_x = iE_y
+rr0=jnp.matmul(scales, rr0)
+r0=circular_aperture(5, rr0) #cut out a circle
+
+### Shadowgraphy, no polarisation
+## object_length: determines where the focal plane is. If you object is 10 mm long, object length = 5 will
+## make the focal plane in the middle of the object. Yes, it's a bad variable name.
+s = Shadowgraphy(rr0, L = 400, R = 25, object_length=5)
+s.solve()
+s.histogram(bin_scale = 25)
+fig, axs = plt.subplots(figsize=(6.67, 6))
+
+cm='gray'
+clim=[0,100]
+
+s.plot(axs, clim=clim, cmap=cm)
+
+###CREATE A SHOCK PAIR FOR TESTING###
+def α(x, n_e0, w, x0, Dx, l=10):
+    dn_e = n_e0*(jnp.tanh((x+Dx+x0)/w)**2-jnp.tanh((x-Dx+x0)/w)**2)
+    n_c=1e21
+    a = 0.5* l/n_c * dn_e
+    return a
+
+def ne(x,n_e0, w, Dx, x0):
+    return n_e0*(jnp.tanh((x+Dx+x0)/w)-jnp.tanh((x-Dx+x0)/w))
+
+def ne_ramp(y, ne_0, scale):
+    return ne_0*10**(y/scale)
+
+# Parameters for shock pair
+w=0.1
+Dx=1
+x0=0
+ne0=1e18
+s=5
+
+x=jnp.linspace(-5,5,1000)
+y=jnp.linspace(-5,5,1000)
+
+a=α(x, n_e0=ne0, w=w, Dx=Dx, x0=x0)
+n=ne(x, n_e0=ne0, w=w, Dx=Dx, x0=x0)
+ne0s=ne_ramp(y, ne_0=ne0, scale=s)
+
+nn=jnp.asarray([ne(x, n_e0=n0, w=w, Dx=Dx, x0=x0) for n0 in ne0s])
+nn=jnp.rot90(nn)
+
+###PLOT SHOCKS###
+fig, (ax1,ax2) = plt.subplots(1,2, figsize=(6.67/2, 2))
+
+ax1.imshow(nn, clim=[1e16,1e19], cmap='inferno')
+ax1.axis('off')
+ax2.plot(x, n/5e18, label=r'$n_e$')
+ax2.plot(x, a*57, label=r'$\alpha$')
+
+ax2.set_xlim([-5,5])
+ax2.set_xticks([])
+ax2.set_yticks([])
+ax2.legend(borderpad=0.5, handlelength=1, handletextpad=0.2, labelspacing=0.2)
+fig.subplots_adjust(left=0, bottom=0.14, right=0.98, top=0.89, wspace=0.1, hspace=None)
+
+###DEFLECT RAYS###
+r0[3,:]=α(r0[2,:],n_e0=ne_ramp(r0[0,:], ne0, s), w=w, Dx=Dx, x0=x0)
+
+###SOLVE FOR RAYS###
+b=refractometerRays(r0)
+sh=ShadowgraphyRays(r0)
+sc=SchlierenRays(r0)
+
+sh.solve(displacement=10)
+sh.histogram(bin_scale=10)
+sc.solve()
+sc.histogram(bin_scale=10)
+b.solve()
+b.histogram(bin_scale=10)
+
+###PLOT DATA###
+fig, axs = plt.subplots(1,3,figsize=(6.67, 1.8))
+
+cm='gray'
+clim=[0,100]
+
+sh.plot(axs[1], clim=clim, cmap=cm)
+#axs[0].imshow(nn.T, extent=[-5,5,-5,5])
+sc.plot(axs[0], clim=clim, cmap=cm)
+b.plot(axs[2], clim=clim, cmap=cm)
+
+for ax in axs:
+    ax.axis('off')
+fig.subplots_adjust(left=0, bottom=0, right=1, top=1, wspace=0.1, hspace=None)
+"""
+
+def m_to_mm(r):
+    rr = jnp.copy(r)
+    rr = rr.at[0::2, :].set(rr[0::2, :] * 1e3)
+
+    return rr
+
+def mm_to_m(r):
+    rr = jnp.copy(r)
+    rr = rr.at[0::2, :].set(rr[0::2, :] * 1e-3)
+
+    return rr
+
+def lens(r, f1, f2):
+    """
+    4x4 matrix for a thin lens, focal lengths f1 and f2 in orthogonal axes
+    See: https://en.wikipedia.org/wiki/Ray_transfer_matrix_analysis
+    """
+
+    l1 = jnp.asarray([[1, 0],
+            [-1 / f1, 1]])
+    l2 = jnp.asarray([[1, 0],
+            [-1 / f2, 1]])
+
+    L = jnp.zeros((4, 4))
+    L = L.at[:2, :2].set(l1)
+    L = L.at[2:, 2:].set(l2)
+
+    return jnp.matmul(L, r)
+
+def sym_lens(r, f):
+    """
+    Helper function to create an axisymmetryic lens
+    """
+
+    return lens(r, f, f)
+
+def travel(r, d):
+    """4x4 matrix  matrix for travelling a travel d
+    See: https://en.wikipedia.org/wiki/Ray_transfer_matrix_analysis
+    """
+
+    d = jnp.asarray([[1, d],
+                     [0, 1]])
+
+    L = jnp.zeros((4, 4))
+
+    L = L.at[:2, :2].set(d)
+    L = L.at[2:, 2:].set(d)
+
+    return jnp.matmul(L, r)
+
+def circular_aperture(r, R, E = None):
+    """
+    Rejects rays outside radius R
+    """
+
+    filt = r[0, :] ** 2 + r[2, :] ** 2 > R ** 2
+    # if you want to reject rays outside of the radius, then when filt is true you should set equal to None
+    r = r.at[:, filt].set(jnp.nan)
+
+    if E is not None:
+        # double checks it is a jnp array (matrix in this case, 9*Np) and converts if not
+        # - had issues in the past, is just a 'just in case' thing - likely useless
+        E = jnp.asarray(E).at[:, filt].set(jnp.nan) # filters out all in [:, i] if i contains any jnp.nan values in [:, i] axis
+
+        return r, E
+
+    return r
+
+def circular_stop(r, R):
+    """
+    Rejects rays inside a radius R
+    """
+
+    filt = r[0, :] ** 2 + r[2,:] ** 2 < R ** 2
+    r = r.at[:, filt].set(jnp.nan)
+
+    return r
+
+def annular_stop(r, R1, R2):
+    """
+    Rejects rays which fall between R1 and R2
+    """
+
+    filt1 = (r[0,:]**2+r[2,:]**2 > R1**2)
+    filt2 = (r[0,:]**2+r[2,:]**2 < R2**2)
+    filt = (filt1 & filt2)
+
+    return filt
+
+def rect_aperture(r, Lx, Ly):
+    """
+    Rejects rays outside a rectangular aperture, total size 2*Lx x 2*Ly
+    """
+
+    filt1 = (r[0, :] ** 2 > Lx ** 2)
+    filt2 = (r[2, :] ** 2 > Ly ** 2)
+
+    filt = filt1 * filt2
+    r = r.at[:, filt].set(jnp.nan)
+
+    return r
+
+def knife_edge(r, offset, axis, direction):
+    """
+    Filters rays using a knife edge.
+    Default is a knife edge in y, can also do a knife edge in x.
+    """
+
+    if axis == 'y':
+        a = 2
+    if axis == 'x':
+        a = 0
+
+    if direction > 0:
+        filt = r[a,:] > offset
+    if direction < 0:
+        filt = r[a,:] < offset
+    if direction == 0:
+        print('Direction must be < 0 or > 0')
+
+    r = r.at[:, filt].set(jnp.nan)
+
+    return r
+
+def clear_rays(self):
+    """
+    Clears the r0, rf and Jf variables to save memory
+    """
+    # does this actually save memory in the best way?
+    # would it be better to del self.r_ instead?
+
+    self.r0 = None
+    self.rf = None
+    self.Jf = None
+
+def ray(x, θ, y, ϕ):
+    """
+    Returns a 4x1 matrix representing a ray. Spatial units must be consistent, angular units in radians.
+    """
+
+    return Matrix([x, θ, y, ϕ])
+
+def d2r(d):
+    # helper function, degrees to radians
+    return d * jnp.pi / 180
+
+def lens_cutoff(rf, Jf = None, *, L = 400, R = 25):
+    """
+    Masks the Jonesvector resulting array to avoid plotting any values outside of some set limit
+    - important as even if you set limits for the histogram to "zoom in", binning is based on raw data
+    --> leading to low resolutions if this is not used!
+
+    Args:
+        rf (jax.Array): Jonesvector output from solver
+        L (int): Length till next lens
+        R (int): Radius of lens
+
+    Return:
+        rf (jax.Array): Masked Jonesvector
+    """
+
+    mask = jnp.pow(jnp.pow(L * jnp.tan(rf[1]) + rf[0], 2) + jnp.pow(L * jnp.tan(rf[3]) + rf[2], 2), 0.5) <= R
+
+    rf = jnp.asarray(rf)[:, mask]
+    if Jf is not None:
+        Jf = jnp.asarray(Jf)[:, mask]
+
+    return rf, Jf
+
+class Diagnostic:
+    """
+    Inheritable class for ray diagnostics.
+    """
+
+    # this is in mm's not metres - self.rf is converted to mm's (not sure if everything else is covered though)
+    def __init__(self, wavelength, rf, Jf = None, *, focal_plane = 0, L = 400, R = 25, Lx = 18, Ly = 13.5, x = None, y = None, x_l = None, y_l = None, l_x = 0, u_x = 0.3, l_y = -5, u_y = 5):
+        """
+        Initialise ray diagnostic.
+
+        Args:
+            r0 (4xN float array): N rays, [x, theta, y, phi]
+
+            L (int, optional): Length scale L. First lens is at L. Defaults to 400.
+            R (int, optional): Radius of lenses. Defaults to 25.
+            Lx (int, optional): Detector size in x. Defaults to 18.
+            Ly (float, optional): Detector size in y. Defaults to 13.5.
+        """     
+
+        self.wavelength, self.focal_plane, self.L, self.R, self.Lx, self.Ly = wavelength, focal_plane, L, R, Lx, Ly
+
+        self.x, self.y, self.x_l, self.y_l = x, y, x_l, y_l
+
+        # these HAVE to stay... for some reason - not entirely sure why you can't just reference self.Beam.r_ directly (or now just rf)
+        # if you can make it without the memory duplication work please do, else DON'T REMOVE!
+
+        # these are created as jax.Array's, yet received as a tuple here?
+        # likely as they are passed externally where jax.numpy module is not loaded
+        # just re-assert type here to fix
+
+        if rf is not None:
+            # separates out the amp/phase part of rf from raw values
+            if rf.shape[0] == 6:
+                self.amp, self.phase = rf[4, :], rf[5, :]
+                rf = rf[:4, :]
+            else:
+                assert rf.shape[0] == 4, colour.BOLD + "\nIncorrect format for rf, are you sure you passed the right variable?" + colour.END
+                self.amp, self.phase = None, None
+
+            # forces self.rf to the last slice if rf returns multiple samples
+            # also preserves the whole pass if required
+            if len(rf.shape) == 3:
+                # rf might be 3-dimensional if it is a series of 2D ray solution slices
+                rf = rf[-1, :, :]
+
+            self.Np = rf.shape[-1]
+
+            # masks rf (& Jf) to only hold entries corr. to rays that will be captured by the lense setup
+            # also forces matrices to type jax.Array via jnp.asarray()
+            self.rf, self.Jf = lens_cutoff(rf, Jf)  # DO pass Jf to this, else self.Jf will be assigned None even if Jf is not None
+
+            self.Np_inc = self.rf.shape[-1]
+            if self.Np == self.Np_inc:
+                print("\nAll rays incident on lens!")
+            else:
+                print("\n{} rays received, {} incident on the first lens.".format(str(self.Np), str(self.Np_inc)))
+                print(" --> {} % of rays wasted!".format(str(round_to_n((1 - self.Np_inc / self.Np) * 100, 3))))
+        else:
+            assert "rf should not be of Noneype! diffrax clearly failed."
+
+        # however, doesn't have to be done manually now as already sorted in propagator.py, therefore no more duplication
+        # still odd though... (hence the keeping of the comment)
+
+        self.r0 = m_to_mm(self.rf)
+
+    def propagate_E(self, r1, r0):
+        dx = r1[0, :] - r0[0, :]
+        dy = r1[2, :] - r0[2, :]
+
+        k = 2 * jnp.pi / self.wavelength
+
+        self.Jf = self.Jf.at[:, :].set(self.Jf[:, :] * jnp.exp(1.0j * k * jnp.sqrt(dx ** 2 + dy ** 2 + (r1[1, :] - r0[1, :]) ** 2)))
+
+    def histogram(self, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False, plain_plot = False, extra_info = True):
+        """
+        Bin data into a histogram. Defaults are for a KAF-8300.
+        Outputs are H, the histogram, and xedges and yedges, the bin edges.
+
+        Args:
+            bin_scale (int, optional): bin size, same in x and y. Defaults to 1.
+            pix_x (int, optional): number of x pixels in detector plane. Defaults to 3448.
+            pix_y (int, optional): number of y pixels in detector plane. Defaults to 2574.
+        """
+
+        if plain_plot:
+            x, y = count_nans(self.r0, ret = True)
+        else:
+            x, y = count_nans(self.rf, ret = True)
+
+        self.H, self.xedges, self.yedges = jnp.histogram2d(x, y, bins=[np.floor(pix_x / bin_scale).astype(np.int64), np.floor(pix_y / bin_scale).astype(np.int64)], range=[[-self.Lx / 2, self.Lx / 2],[-self.Ly / 2, self.Ly / 2]])
+        self.H = self.H.T
+
+        #Optional - clear ray attributes to save memory
+        if clear_mem:
+            clear_rays(self)
+
+    def plot(self, ax, clim = None, cmap = None):
+        ax.imshow(self.H, interpolation='nearest', origin='lower', clim=clim, cmap=cmap, extent = [self.xedges[0], self.xedges[-1], self.yedges[0], self.yedges[-1]])
+
+    def histogram_legacy(self, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
+        # repeated across many functions, have made a wrapper for it instead of repeats to preserve backwards compatability
+        # was this replaced by jnp.histogram2d function?
+        # this function is far slower for a general histogram than the new function - yet is used for refractogram and interferogram so kept to be wrapped for those
+        x_bins = jnp.linspace(-self.Lx // 2, self.Lx // 2, np.floor(pix_x / bin_scale).astype(np.int64))
+        y_bins = jnp.linspace(-self.Ly // 2, self.Ly // 2, np.floor(pix_y / bin_scale).astype(np.int64))
+
+        amplitude_x = jnp.zeros((len(y_bins) - 1, len(x_bins) - 1), dtype = complex)
+        amplitude_y = jnp.zeros((len(y_bins) - 1, len(x_bins) - 1), dtype = complex)
+
+        x_indices = jnp.digitize(self.rf[0, :], x_bins) - 1
+        y_indices = jnp.digitize(self.rf[2, :], y_bins) - 1
+
+        mask = (0 <= x_indices) & (x_indices < amplitude_x.shape[1]) & (0 <= y_indices) & (y_indices < amplitude_x.shape[0])
+
+        # jax arrays are immutable - fix later
+        amplitude_x = amplitude_x.at[y_indices[mask], x_indices[mask]].set(amplitude_x[y_indices[mask], x_indices[mask]] + self.Jf[0, mask])
+        amplitude_y = amplitude_y.at[y_indices[mask], x_indices[mask]].set(amplitude_y[y_indices[mask], x_indices[mask]] + self.Jf[1, mask])
+
+        amplitude = jnp.sqrt(jnp.real(amplitude_x) ** 2 + jnp.real(amplitude_y) ** 2)
+        # amplitude_normalised = (amplitude - amplitude.min()) / (amplitude.max() - amplitude.min()) # this line needs work and is currently causing problems
+        self.H = amplitude
+
+    def plot_rays(self, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
+        self.histogram(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem, plain_plot = True)
+
+class Shadowgraphy(Diagnostic):
+    """
+    Example shadowgraphy diagnostic. Inherits from Rays, has custom solve method.
+    Implements a two lens telescope with M = 1 and a single lens system with M = 2. Both lenses have a f = L/2 focal length, where L is a length scale specified when the class is initialized.
+    Each optic has a radius R, which is used to reject rays outside the numerical aperture of the optical system.
+    """
+
+    def single_lens_solve(self):
+        ## single lens - M = Variable (around ~2) (based on Detector position. Real experimental setup)
+        r1 = travel(self.r0, 3 * self.L / 4 - self.focal_plane) #displace rays to lens. Accounts for object with depth
+        r2 = circular_aperture(r1, self.R)      # cut off
+        r3 = sym_lens(r2, self.L / 2)             # lens 1
+        r4 = travel(r3, 3*self.L / 2)           # detector
+        self.rf = r4
+
+    def two_lens_solve(self):
+        ## 2 lens telescope, M = 1
+        r1 = travel(self.r0, self.L - self.focal_plane) #displace rays to lens. Accounts for object with depth
+        r2 = circular_aperture(r1, self.R)    # cut off
+        r3 = sym_lens(r2, self.L / 2)           # lens 1
+        r4 = travel(r3, self.L * 2)           # displace rays to lens 2.
+        r5 = circular_aperture(r4, self.R)    # cut off
+        r6 = sym_lens(r5, self.L / 2)           # lens 2
+        r7 = travel(r6, self.L)             # displace rays to detector
+        self.rf = r7
+    
+class Schlieren(Diagnostic):
+    """
+    Example dark field schlieren diagnostic. Inherits from Rays, has custom solve method.
+    Implements a two lens telescope with M = 1. Both lenses have a f = L focal length, where L is a length scale specified when the class is initialized.
+    Each optic has a radius R, which is used to reject rays outside the numerical aperture of the optical system.
+    There is a circular stop placed at the focal point after the first lens which rejects rays which hit the focal planes at travel less than R [mm] from the optical axis.
+    """
+
+    def DF_solve(self, R = 1):
+        ## 2 lens telescope, M = 1
+        r1 = travel(self.r0, self.L - self.focal_plane) #displace rays to lens. Accounts for object with depth
+        r2 = circular_aperture(r1, self.R) # cut off
+    
+        r3 = sym_lens(r2, self.L) #lens 1
+
+        r4 = travel(r3, self.L) #displace rays to stop
+
+        # this and positioning of lenses means schlieren ends up with less usable rays than other methods
+        r5 = circular_stop(r4, R = R) # stop - blocker at focal point after the first lens of size R (1 mm?)
+
+        r6 = travel(r5, self.L) #displace rays to lens 2
+
+        r7 = circular_aperture(r6, self.R) # cut off
+
+        r8 = sym_lens(r7, self.L) #lens 2
+
+        r9 = travel(r8, self.L) #displace rays to detector
+
+        self.rf = r9
+    
+    """
+    Example light field schlieren diagnostic. Inherits from Rays, has custom solve method.
+    Implements a two lens telescope with M = 1. Both lenses have a f = L/2 focal length, where L is a length scale specified when the class is initialized.
+    Each optic has a radius R, which is used to reject rays outside the numerical aperture of the optical system.
+    There is a circular stop placed at the focal point afte rthe first lens which accepts only rays which hit the focal planes at travel less than R [mm] from the optical axis.
+    """
+
+    def LF_solve(self, R = 1):
+        ## 2 lens telescope, M = 1
+        r1 = travel(self.r0, self.L - self.focal_plane) #displace rays to lens. Accounts for object with depth
+        r2 = circular_aperture(r1, self.R) # cut off
+        r3 = sym_lens(r2, self.L) #lens 1
+
+        r4 = travel(r3, self.L) #displace rays to stop
+        r5 = circular_aperture(r4, R = R) # stop
+
+        r6 = travel(r5, self.L) #displace rays to lens 2
+        r7 = circular_aperture(r6, self.R) # cut off
+        r8 = sym_lens(r7, self.L) #lens 2
+
+        r9 = travel(r8, self.L) #displace rays to detector
+        self.rf = r9
+        
+class Refractometry(Diagnostic):
+    """
+    Example of Imaging Refractometer. Inherits from Rays, has custom solve method.
+    Implements a spherical lens with focal length f1 = L/2 and M = 2 for the spatial axis and a cylindrical lens
+    with focal length f1 and f2.
+    """
+
+    def incoherent_solve(self):
+        ##
+        ## Is there an efficient way to chain these so needlessly variables are not used without having 1 really long line
+        ##
+
+        ## Imaging the spatial axis - M = 2
+        r1 = travel(self.r0, 3 * self.L / 4 - self.focal_plane) #displace rays to lens 1. Accounts for object with depth
+        r2 = circular_aperture(r1, self.R)      # cut off
+        r3 = sym_lens(r2, self.L/2)             # lens 1 - spherical
+        r4 = travel(r3, 3*self.L/2)           # displace rays to lens 2 - hybrid
+        r5 = rect_aperture(r4, 15, 30)          # rectangular lens cut-off
+        r6 = circular_aperture(r5, self.R)      # cut off
+        r7 = lens(r6, self.L/3, self.L/2)       # lens 2 - hybrid lens
+        r8 = travel(r7, self.L)               # displace rays to detector
+        self.rf = r8
+
+    def coherent_solve(self):
+        ## Imaging the spatial axis - M = 2 - Coherent Implementation of the Refractometer
+        r1 = travel(self.r0, 3 * self.L / 4 - self.focal_plane)
+        # propagate E field
+        self.propagate_E(r1, self.r0)
+
+        r2, self.Jf = circular_aperture(self.r0, self.R, E = self.Jf)      # cut off
+        r3 = sym_lens(r2, self.L / 2)          # lens 1 - spherical
+        self.propagate_E(r3, r2)
+
+        r4 = travel(r3, 3 * self.L / 2)
+        self.propagate_E(r4, r3)                 # displace rays to lens 2 - hybrid
+
+        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)      # cut off
+        r6 = lens(r5, self.L / 3, self.L / 2)       # lens 2 - hybrid lens
+        self.propagate_E(r6, r5)
+
+        self.rf = travel(r6, self.L)               # displace rays to detector
+        self.propagate_E(self.rf, r6)
+
+    def coherent_solve_alt(self):
+        ## Imaging the spatial axis - M = 2 - Coherent Implementation of the Refractometer
+        r1 = travel(self.r0, 3 * self.L / 4 - self.focal_plane)
+
+        r2, self.Jf = circular_aperture(r1, self.R, E = self.Jf)      # cut off
+        # propagate E field
+        self.propagate_E(r2, r1)
+
+        r3 = sym_lens(r2, self.L / 2)          # lens 1 - spherical
+        self.propagate_E(r3, r2)
+
+        r4 = travel(r3, 3 * self.L / 2)
+
+        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)      # cut off
+        self.propagate_E(r4, r3)                 # displace rays to lens 2 - hybrid
+        self.propagate_E(r5, r4)                 # displace rays to lens 2 - hybrid
+
+        r6 = lens(r5, self.L / 3, self.L / 2)       # lens 2 - hybrid lens
+        self.propagate_E(r6, r5)
+
+        self.rf = travel(r6, self.L)               # displace rays to detector
+        self.propagate_E(self.rf, r6)
+
+    def refractogram(self, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
+        self.histogram_legacy(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem)
+
+    def fresnel_solve(self, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
+        self.Jf = fresnel_integral.propagate(self.wavelength, self.x, self.y, self.x_l, self.y_l, self.r0, self.amp, self.phase, 3 * self.L / 4 - self.focal_plane)
+        self.histogram_legacy(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem)
+
+class Interferometry(Diagnostic):
+    """
+    Simple class to keep all the ray properties together
+    """
+
+    def interfere_ref_beam(self, n_fringes, deg):
+        """
+        Input beam ray positions and electric field component, and desired angle of evenly spaced background fringes. 
+        Deg is angle in degrees from the vertical axis
+
+        Returns:
+            'Interfered with' E field
+        """
+
+        assert self.Jf is not None, print("\nThis diagnostic requires a calculated Jf matrix.")
+
+        if deg >= 45:
+            deg = - jnp.abs(deg - 90)
+
+        rad = deg * jnp.pi / 180 #deg to rad
+        y_weight = jnp.arctan(rad) #take x_weight is 1
+        x_weight = jnp.sqrt(1 - y_weight**2)
+
+        ref_beam = jnp.exp(2 * n_fringes / 3 * 1.0j * (x_weight * self.rf[0, :] + y_weight * self.rf[2, :]))
+
+        self.Jf = self.Jf.at[1, :].set(self.Jf[1, :] + ref_beam) # assume ref_beam is polarised in y
+
+    def bkg(self, domain_length, n_fringes, deg, ne_extent, probing_direction):
+        rr0, E0 = ray_to_Jonesvector(self.rf, ne_extent, probing_direction = probing_direction, keep_current_plane = True, return_E = True)
+
+        E = self.Jf.copy() #temporarily store E field in another variable
+        self.Jf = E0
+
+        # assuming reference is recombined with the probe beam at the exit of the domain (should be changed)
+        self.interfere_ref_beam(n_fringes, deg)
+        ## 2 lens telescope, M = 1
+        r1 = travel(rr0, self.L + domain_length) #displace rays to lens. Accounts for object with depth
+        # propagate E field
+        self.propagate_E(r1, rr0)
+        r2, self.Jf = circular_aperture(r1, self.R, E = self.Jf)    # cut off
+        r3 = sym_lens(r2, self.L / 2)           # lens 1
+        self.propagate_E(r3, r2)
+
+        r4 = travel(r3, self.L * 2)           # displace rays to lens 2.
+        self.propagate_E(r4, r3)
+        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)    # cut off
+        r6 = sym_lens(r5, self.L / 2)                             # lens 2
+        self.propagate_E(r6, r5)
+        
+        r7 = travel(r6, self.L)             # displace rays to detector
+        self.propagate_E(r7, r6)
+        rf = r7
+
+        self.histogram(self)
+        self.bkg_signal = self.H
+
+        self.Jf = E #restore E field
+
+    def two_lens_solve(self):
+        # assuming reference is recombined with the probe beam at the exit of the domain (should be changed)
+        self.interfere_ref_beam(10, 20)
+        ## 2 lens telescope, M = 1
+        r1 = travel(self.r0, self.L - self.focal_plane) #displace rays to lens. Accounts for object with depth
+
+        # propagate E field
+        self.propagate_E(r1, self.r0)
+        r2, self.Jf = circular_aperture(r1, self.R, E = self.Jf)    # cut off
+
+        r3 = sym_lens(r2, self.L/2)           # lens 1
+        self.propagate_E(r3, r2)
+
+        r4 = travel(r3, self.L*2)           # displace rays to lens 2.
+        self.propagate_E(r4, r3)
+
+        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)    # cut off
+
+        r6 = sym_lens(r5, self.L/2)                             # lens 2
+        self.propagate_E(r6, r5)
+        
+        r7 = travel(r6, self.L)             # displace rays to detector
+        self.propagate_E(r7, r6)
+
+        self.rf = r7
+
+    def interferogram(self, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
+        self.histogram_legacy(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem)
