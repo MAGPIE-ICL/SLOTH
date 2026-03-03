@@ -5,8 +5,6 @@ import numpy as np
 import jax.numpy as jnp
 from sympy import Matrix
 
-import simulator.fresnel_integral as fresnel_integral
-
 from shared.propagation import ray_to_Jonesvector
 
 from shared.utils import count_nans

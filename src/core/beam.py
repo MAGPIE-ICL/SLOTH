@@ -63,7 +63,7 @@ class Beam:
         Function designed to be called by the Beam class during probe initialisation to complete the construction ray construction from beam parameterss.
 
         Updated object definitions:
-            s0, 9 x N float: N rays with (x, y, z, vx, vy, vz) in m, m/s and amplitude, phase and polarisation (a, p, r)
+            s0, 6 x N float: N rays with (x, y, z, vx, vy, vz) in m, m/s
 
         :param self: Beam object containing its parameters
         :type fn: simulator.beam.Beam object
@@ -80,7 +80,7 @@ class Beam:
 
         from scipy.constants import c
 
-        s0 = jnp.zeros((9, self.Np))
+        s0 = jnp.zeros((6, self.Np))
         if(self.beam_type == 'circular'):
             from shared.utils import generic_valid_types as valid_types
             assert isinstance(self.beam_size, valid_types), "\nReceived beam_size of shape" + str(len(self.beam_size)) + "expected a float."
@@ -322,11 +322,6 @@ class Beam:
         del u
         del ϕ
         del χ
-
-        # Initialise amplitude, phase and polarisation
-        s0 = s0.at[6, :].set(1.0)
-        #s0 = s0.at[7, :].set(0.0)
-        #s0 = s0.at[8, :].set(0.0)
 
         self.s0 = s0
         #self.rf = s0

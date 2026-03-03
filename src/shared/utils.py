@@ -170,53 +170,78 @@ def heat_plot(x, y, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, Lx = 18, Ly = 
     #axis.set_xlim([-9, 9])
     #axis.set_ylim([-6.75, 6.75])
 
-def memory_report(running_device = None, memory_limit = None):
+import numpy as np
+import jax
+import jax.numpy as jnp
+
+def memory_report(running_device=None, memory_limit=None):
+    """
+    Report total/used/free memory for cpu/gpu.
+    - CPU: uses psutil
+    - GPU: uses pynvml (GPU 0)
+    - TPU: not implemented (returns None fields)
+    """
+
+    # Determine backend/device safely (no xla_bridge)
     if running_device is None:
-        from jax.lib import xla_bridge
-        running_device = xla_bridge.get_backend().platform
+        running_device = jax.default_backend()  # 'cpu', 'gpu', or 'tpu'
 
-    if running_device == 'cpu':
+    info = None
+    free = total = used = None
+
+    if running_device == "cpu":
         from psutil import virtual_memory
-
         info = virtual_memory()
+        total = info.total
+        used  = info.used
+        free  = info.available  # "available" is the best proxy for free RAM on modern OSes
 
-        free = info.available
-    elif running_device == 'gpu':
-        from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
-
+    elif running_device == "gpu":
+        from pynvml import (
+            nvmlInit,
+            nvmlDeviceGetHandleByIndex,
+            nvmlDeviceGetMemoryInfo,
+        )
         nvmlInit()
-
         h = nvmlDeviceGetHandleByIndex(0)
         info = nvmlDeviceGetMemoryInfo(h)
+        total = info.total
+        used  = info.used
+        free  = info.free
 
-        free = info.free
-    elif running_device == 'tpu':
-        free_mem = None
+    elif running_device == "tpu":
+        # TPU memory queries are non-trivial; return Nones rather than breaking
+        total = used = free = None
+
     else:
-        assert "\nNo suitable device detected when checking ram/vram available."
-
-    total = info.total
-    used = info.used
+        raise RuntimeError(f"No suitable device detected: {running_device}")
 
     results = {
-        'device': running_device,
-        'total_raw': total,
-        'total': mem_conversion(total),
-        'free_raw': free,
-        'free': mem_conversion(free),
-        'used_raw': used,
-        'used': mem_conversion(used)
+        "device": running_device,
+        "total_raw": total,
+        "total": mem_conversion(total) if total is not None else None,
+        "free_raw": free,
+        "free": mem_conversion(free) if free is not None else None,
+        "used_raw": used,
+        "used": mem_conversion(used) if used is not None else None,
     }
 
-    if memory_limit is not None:
-        memory_limit *= 1024
-        if memory_limit < results['total_raw']:
-            results['total_raw'] = memory_limit
-            results['total'] = mem_conversion(results['total_raw'])
+    # Optional cap on "total" memory reported (memory_limit assumed in MiB unless you intend GiB)
+    if memory_limit is not None and results["total_raw"] is not None:
+        memory_limit_bytes = int(memory_limit) * 1024 * 1024  # MiB -> bytes
+        if memory_limit_bytes < results["total_raw"]:
+            results["total_raw"] = memory_limit_bytes
+            results["total"] = mem_conversion(memory_limit_bytes)
 
-            results['free_raw'] = memory_stats['total_raw'] - results['used_raw']
-            results['free'] = mem_conversion(results['free_raw'])
+            # recompute free based on capped total
+            if results["used_raw"] is not None:
+                results["free_raw"] = max(0, results["total_raw"] - results["used_raw"])
+                results["free"] = mem_conversion(results["free_raw"])
 
     return results
 
-generic_valid_types = (int, np.int32, np.int64, jnp.int32, jnp.int64, float, np.float32, np.float64, jnp.float32, jnp.float64)
+
+generic_valid_types = (
+    int, np.int32, np.int64, jnp.int32, jnp.int64,
+    float, np.float32, np.float64, jnp.float32, jnp.float64
+)
