@@ -100,7 +100,7 @@ def dndr(r, gradient_term, omega, x, y, z):
     return grad
 
 # ODEs of photon paths, standalone function to support the solve()
-def dsdt(t, s, parallelise, inv_brems, phaseshift, B_on, ne, B, Te, Z, x, y, z, omega, VerdetConst, lengths, dims, opacity, edensity, refrac_field, opacity_interp):
+def dsdt(t, s, parallelise, inv_brems, ne, x, y, z, omega, lengths, dims, edensity, refrac_field):
     """
     Returns an array with the gradients and velocity per ray for ode_int
 
@@ -157,8 +157,11 @@ def dsdt(t, s, parallelise, inv_brems, phaseshift, B_on, ne, B, Te, Z, x, y, z, 
     ## Commented out code is previous version - this was apparently causing floating point errors (Alan did not specify what/how)
     ## Second form of this is the expansion of the n_refrac() function directly into calculation
     ##
+
+    # Keep derivative shape consistent with solver state shape (flattened 1D state vector).
+    return jnp.ravel(sprime)
    
-def process_results(solutions, depth_traced, trace_depth, probing_direction, return_E, duration, save_points_per_region, ray_batch_count, verbose, amp_phase_return):
+def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose):
     """
     #for i in enumerate(sol.result):
     #    print(i)
@@ -280,7 +283,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
     print("\nNumber of domain batches:", region_count)
     print("Number of ray batches:", ray_batch_count)
 
-    from simulator.beam import Beam
+    from core.beam import Beam
     assert not isinstance(beam, Beam), "\nThis function does not take in the direct output of the Beam object, pass either Beam.s0 rays, or the parameters passed to be Beam here as a tuple if batching rays."
 
     unbatched_beam = False
@@ -361,8 +364,6 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     ne_type = ScalarDomain.ne_type
 
                     refrac_field = ScalarDomain.refrac_field
-                    densities = ScalarDomain.densities
-                    num_materials = ScalarDomain.num_materials
 
                     inv_brems = ScalarDomain.inv_brems
                     edensity = ScalarDomain.edensity
@@ -381,13 +382,11 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     except:
                         ScalarDomain = None
 
-                    import simulator.domain as d
+                    import core.domain as d
                     ScalarDomain = d.ScalarDomain(
                         lengths, dims,
                         ne_type = ne_type,
                         refrac_field = refrac_field,
-                        densities = densities,
-                        num_materials = num_materials,
                         inv_brems = inv_brems,
                         edensity = edensity,
                         probing_direction = probing_direction,
@@ -405,14 +404,9 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     del ne_type
 
                     del refrac_field
-                    del opacity_files
                     del densities
-                    del num_materials
 
                     del inv_brems
-                    del opacity
-                    del phaseshift
-                    del B_on
                     del edensity
 
                     del probing_direction
@@ -451,7 +445,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             # passed args must be hashable to be made static for jax.jit, tuple is hashable, array & dict are not
             args = (
                 parallelise, ScalarDomain.inv_brems, 
-                ScalarDomain.ne, ScalarDomain.B, ScalarDomain.Te, ScalarDomain.Z,
+                ScalarDomain.ne,
                 ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
                 omega, 
                 ScalarDomain.lengths, ScalarDomain.dims,
@@ -482,8 +476,8 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             else:
                 # transposed as jax.vmap() expects form of [batch_idx, items] not [items, batch_idx]
                 available_devices = jax.devices()
-
-                running_device = jax.lib.xla_bridge.get_backend().platform # - deprecated, using still as needed for HPC
+                running_device = jax.default_backend()
+                # running_device = jax.lib.xla_bridge.get_backend().platform # - deprecated, using still as needed for HPC
                 #running_device = jax.extend.backend.get_backend().platform
                 print("\nRunning device:", running_device, end='')
 
@@ -496,32 +490,15 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     del sol
 
                 if running_device == 'cpu':
-                    core_count = int(os.environ['XLA_FLAGS'].replace("--xla_force_host_platform_device_count=", ''))
+                    cpu_devices = jax.devices('cpu')
+                    core_count = len(cpu_devices)
                     print(", with:", core_count, "cores.")
 
-                    if Np >= core_count:
-                        from jax.sharding import PartitionSpec as P, NamedSharding
+                    # Avoid manual NamedSharding mesh setup here; recent JAX versions can
+                    # raise mesh-axis errors in this path. vmap still parallelises compute.
+                    s0 = jax.device_put(s0_transformed)
 
-                        # Create a Sharding object to distribute a value across devices:
-                        # Assume self.core_count is the no. of core devices available
-                        mesh = jax.make_mesh((core_count,), ('rows',))  # 1D mesh for columns
-
-                        # Specify sharding: don't split axis 0 (rows), split axis 1 (columns) across devices
-                        # then apply sharding to rewrite s0 as a sharded array from it's original matrix
-                        # and use jax.device_put to distribute it across devices:
-                        Np = ((Np // core_count) * core_count)
-                        #assert Np > 0, "Not enough rays to parallelise over cores, increase to at least " + str(core_count)
-
-                        # if you don't wish to transpose before operation you need to use the old call
-                        # s0 = jax.device_put(s0_transformed[:, 0:Np], NamedSharding(mesh, P(None, 'cols')))
-                        s0 = jax.device_put(s0_transformed[0:Np, :], NamedSharding(mesh, P('rows', None)))  # 'None' means don't shard axis 0
-
-                        print(s0.sharding)            # See the sharding spec
-                        #print(s0.addressable_shards)  # Check each device's shard
-                        #jax.debug.visualize_array_sharding(s0)
-                    else:
-                        s0 = jax.device_put(s0_transformed)
-
+                    if Np < core_count:
                         print(colour.BOLD + "Not enough rays to parallelise over cores" + colour.END + ": increase to at least " + str(core_count) + " to utilise parallelisation")
                         print(" --> Running CPU processes sequentially")
                 elif running_device == 'gpu':
@@ -711,7 +688,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     '''
                     from utils.handle_filetypes import save_jax_matrix_to_hdf5 as compressed_solution_export
                     filepath, filename = compressed_solution_export(
-                        ray_to_Jonesvector(sol.ys[:,-1].reshape(9, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction, return_E = return_E, amp_phase_return = amp_phase_return)[0],
+                        ray_to_Jonesvector(sol.ys[:,-1].reshape(6, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction)[0],
                         file_path = target_folder
                         #filename = None, file_path = ".", dataset_name = 'data', compression = 'gzip', compression_level = 4
                     )
@@ -726,7 +703,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     filename = "run_" + str(ray_index)
                     stream_data_to_tar_gz(tar_gz_path, filename,
                         compress_matrix_to_hdf5_BytesIO(
-                            ray_to_Jonesvector(sol.ys[:,-1].reshape(9, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction, return_E = return_E, amp_phase_return = amp_phase_return)[0]
+                            ray_to_Jonesvector(sol.ys[:,-1].reshape(6, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction)[0]
                         )
                     )
                 else:
@@ -742,10 +719,10 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             return solutions, None, duration
         else:
             if not parallelise:
-                return *ray_to_Jonesvector(solutions.ys[:,-1].reshape(9, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction, return_E = return_E, amp_phase_return = amp_phase_return), duration
+                return *ray_to_Jonesvector(solutions.ys[:,-1].reshape(6, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction), duration
             else:
                 # need to confirm there is no mismatch between total depth_traced and the target probing_depth
-                return process_results(solutions, depth_traced, trace_depth, ScalarDomain.probing_direction, return_E, duration, save_points_per_region, ray_batch_count, verbose, amp_phase_return)
+                return process_results(solutions, depth_traced, trace_depth, ScalarDomain.probing_direction, duration, save_points_per_region, ray_batch_count, verbose)
     else:
         print("\nData output as a hdf4.tar.gz file due to limitations of vram/ram space.")
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")

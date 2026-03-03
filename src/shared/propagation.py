@@ -1,11 +1,11 @@
 import jax.numpy as jnp
 
 # Need to backproject to ne volume, then find angles
-def ray_to_Jonesvector(rays, *, ne_extent = None, probing_direction = 'z', keep_current_plane = False, return_E = False, amp_phase_return = False):
+def ray_to_Jonesvector(rays, *, ne_extent = None, probing_direction = 'z', keep_current_plane = False):
     # * forces keep_current_plane and return_E to be keyword-only arguments
     # meaning .. return_E = True (missing out keep_current_plane) will work as it will not rely on position
     """
-    Takes the output from the 9D solver and returns 6D rays for ray-transfer matrix techniques.
+    Takes the output from the 6D solver and returns 4D rays for ray-transfer matrix techniques.
     Effectively finds how far the ray is from the end of the volume, returns it to the end of the volume.
 
     Gives position (and angles) in other axes at point where ray is in end plane of its extent in the probing axis
@@ -30,17 +30,8 @@ def ray_to_Jonesvector(rays, *, ne_extent = None, probing_direction = 'z', keep_
     Np = rays.shape[1] # number of photons
 
     x, y, z, vx, vy, vz = rays[0], rays[1], rays[2], rays[3], rays[4], rays[5]
-    if amp_phase_return or return_E:
-        amp = rays[6]
-        phase = rays[7]
-
-    if amp_phase_return:
-        ray_p = jnp.zeros((6, Np))
-
-        ray_p = ray_p.at[4].set(amp)
-        ray_p = ray_p.at[5].set(phase)
-    else:
-        ray_p = jnp.zeros((4, Np))
+  
+    ray_p = jnp.zeros((4, Np))
 
     # Resolve distances and angles
     # YZ plane
@@ -104,39 +95,8 @@ def ray_to_Jonesvector(rays, *, ne_extent = None, probing_direction = 'z', keep_
     del vx
     del vy
     del vz
-
-    if return_E:
-        ray_J = jnp.zeros((2, Np), dtype = complex)
-
-        # Resolve Jones vectors
-        pol = rays[8]
-
-        # Assume initially polarised along y
-        E_x_init = jnp.zeros(Np)
-        E_y_init = jnp.ones(Np)
-
-        # Perform rotation for polarisation, multiplication for amplitude, and complex rotation for phase
-        ray_J = ray_J.at[0, :].set(amp * (jnp.cos(phase) + 1.0j * jnp.sin(phase)) * (jnp.cos(pol) * E_x_init - jnp.sin(pol) * E_y_init))
-        ray_J = ray_J.at[1, :].set(amp * (jnp.cos(phase) + 1.0j * jnp.sin(phase)) * (jnp.sin(pol) * E_x_init + jnp.cos(pol) * E_y_init))
-
-        del amp
-        del phase
-        del pol
-
-        del E_x_init
-        del E_y_init
-
     del Np
-
-    if amp_phase_return or return_E:
-        del amp
-        del phase
-
-    # ray_p [x, phi, y, theta] +? [amp, phase], ray_J [E_x, E_y]
-
-    if return_E:
-        ray_p, ray_J
-
+    
     return ray_p, None
 
 def back_propogate(rays, ne_extent, probing_direction):
