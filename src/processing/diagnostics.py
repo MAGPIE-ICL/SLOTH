@@ -282,7 +282,6 @@ def lens_cutoff(rf, Jf = None, *, L = 400, R = 25):
     Return:
         rf (jax.Array): Masked Jonesvector
     """
-
     mask = jnp.pow(jnp.pow(L * jnp.tan(rf[1]) + rf[0], 2) + jnp.pow(L * jnp.tan(rf[3]) + rf[2], 2), 0.5) <= R
 
     rf = jnp.asarray(rf)[:, mask]
@@ -322,14 +321,7 @@ class Diagnostic:
         # just re-assert type here to fix
 
         if rf is not None:
-            # separates out the amp/phase part of rf from raw values
-            if rf.shape[0] == 6:
-                self.amp, self.phase = rf[4, :], rf[5, :]
-                rf = rf[:4, :]
-            else:
-                assert rf.shape[0] == 4, colour.BOLD + "\nIncorrect format for rf, are you sure you passed the right variable?" + colour.END
-                self.amp, self.phase = None, None
-
+            assert rf.shape[0] == 4, colour.BOLD + "\nIncorrect format for rf, are you sure you passed the right variable?" + colour.END
             # forces self.rf to the last slice if rf returns multiple samples
             # also preserves the whole pass if required
             if len(rf.shape) == 3:
@@ -340,8 +332,9 @@ class Diagnostic:
 
             # masks rf (& Jf) to only hold entries corr. to rays that will be captured by the lense setup
             # also forces matrices to type jax.Array via jnp.asarray()
-            self.rf, self.Jf = lens_cutoff(rf, Jf)  # DO pass Jf to this, else self.Jf will be assigned None even if Jf is not None
-
+            
+            self.rf, self.Jf = lens_cutoff(rf, Jf, L = self.L, R = self.R)  # DO pass Jf to this, else self.Jf will be assigned None even if Jf is not None
+            
             self.Np_inc = self.rf.shape[-1]
             if self.Np == self.Np_inc:
                 print("\nAll rays incident on lens!")
@@ -355,14 +348,6 @@ class Diagnostic:
         # still odd though... (hence the keeping of the comment)
 
         self.r0 = m_to_mm(self.rf)
-
-    def propagate_E(self, r1, r0):
-        dx = r1[0, :] - r0[0, :]
-        dy = r1[2, :] - r0[2, :]
-
-        k = 2 * jnp.pi / self.wavelength
-
-        self.Jf = self.Jf.at[:, :].set(self.Jf[:, :] * jnp.exp(1.0j * k * jnp.sqrt(dx ** 2 + dy ** 2 + (r1[1, :] - r0[1, :]) ** 2)))
 
     def histogram(self, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False, plain_plot = False, extra_info = True):
         """
@@ -518,139 +503,5 @@ class Refractometry(Diagnostic):
         r8 = travel(r7, self.L)               # displace rays to detector
         self.rf = r8
 
-    def coherent_solve(self):
-        ## Imaging the spatial axis - M = 2 - Coherent Implementation of the Refractometer
-        r1 = travel(self.r0, 3 * self.L / 4 - self.focal_plane)
-        # propagate E field
-        self.propagate_E(r1, self.r0)
-
-        r2, self.Jf = circular_aperture(self.r0, self.R, E = self.Jf)      # cut off
-        r3 = sym_lens(r2, self.L / 2)          # lens 1 - spherical
-        self.propagate_E(r3, r2)
-
-        r4 = travel(r3, 3 * self.L / 2)
-        self.propagate_E(r4, r3)                 # displace rays to lens 2 - hybrid
-
-        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)      # cut off
-        r6 = lens(r5, self.L / 3, self.L / 2)       # lens 2 - hybrid lens
-        self.propagate_E(r6, r5)
-
-        self.rf = travel(r6, self.L)               # displace rays to detector
-        self.propagate_E(self.rf, r6)
-
-    def coherent_solve_alt(self):
-        ## Imaging the spatial axis - M = 2 - Coherent Implementation of the Refractometer
-        r1 = travel(self.r0, 3 * self.L / 4 - self.focal_plane)
-
-        r2, self.Jf = circular_aperture(r1, self.R, E = self.Jf)      # cut off
-        # propagate E field
-        self.propagate_E(r2, r1)
-
-        r3 = sym_lens(r2, self.L / 2)          # lens 1 - spherical
-        self.propagate_E(r3, r2)
-
-        r4 = travel(r3, 3 * self.L / 2)
-
-        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)      # cut off
-        self.propagate_E(r4, r3)                 # displace rays to lens 2 - hybrid
-        self.propagate_E(r5, r4)                 # displace rays to lens 2 - hybrid
-
-        r6 = lens(r5, self.L / 3, self.L / 2)       # lens 2 - hybrid lens
-        self.propagate_E(r6, r5)
-
-        self.rf = travel(r6, self.L)               # displace rays to detector
-        self.propagate_E(self.rf, r6)
-
     def refractogram(self, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
-        self.histogram_legacy(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem)
-
-    def fresnel_solve(self, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
-        self.Jf = fresnel_integral.propagate(self.wavelength, self.x, self.y, self.x_l, self.y_l, self.r0, self.amp, self.phase, 3 * self.L / 4 - self.focal_plane)
-        self.histogram_legacy(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem)
-
-class Interferometry(Diagnostic):
-    """
-    Simple class to keep all the ray properties together
-    """
-
-    def interfere_ref_beam(self, n_fringes, deg):
-        """
-        Input beam ray positions and electric field component, and desired angle of evenly spaced background fringes. 
-        Deg is angle in degrees from the vertical axis
-
-        Returns:
-            'Interfered with' E field
-        """
-
-        assert self.Jf is not None, print("\nThis diagnostic requires a calculated Jf matrix.")
-
-        if deg >= 45:
-            deg = - jnp.abs(deg - 90)
-
-        rad = deg * jnp.pi / 180 #deg to rad
-        y_weight = jnp.arctan(rad) #take x_weight is 1
-        x_weight = jnp.sqrt(1 - y_weight**2)
-
-        ref_beam = jnp.exp(2 * n_fringes / 3 * 1.0j * (x_weight * self.rf[0, :] + y_weight * self.rf[2, :]))
-
-        self.Jf = self.Jf.at[1, :].set(self.Jf[1, :] + ref_beam) # assume ref_beam is polarised in y
-
-    def bkg(self, domain_length, n_fringes, deg, ne_extent, probing_direction):
-        rr0, E0 = ray_to_Jonesvector(self.rf, ne_extent, probing_direction = probing_direction, keep_current_plane = True, return_E = True)
-
-        E = self.Jf.copy() #temporarily store E field in another variable
-        self.Jf = E0
-
-        # assuming reference is recombined with the probe beam at the exit of the domain (should be changed)
-        self.interfere_ref_beam(n_fringes, deg)
-        ## 2 lens telescope, M = 1
-        r1 = travel(rr0, self.L + domain_length) #displace rays to lens. Accounts for object with depth
-        # propagate E field
-        self.propagate_E(r1, rr0)
-        r2, self.Jf = circular_aperture(r1, self.R, E = self.Jf)    # cut off
-        r3 = sym_lens(r2, self.L / 2)           # lens 1
-        self.propagate_E(r3, r2)
-
-        r4 = travel(r3, self.L * 2)           # displace rays to lens 2.
-        self.propagate_E(r4, r3)
-        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)    # cut off
-        r6 = sym_lens(r5, self.L / 2)                             # lens 2
-        self.propagate_E(r6, r5)
-        
-        r7 = travel(r6, self.L)             # displace rays to detector
-        self.propagate_E(r7, r6)
-        rf = r7
-
-        self.histogram(self)
-        self.bkg_signal = self.H
-
-        self.Jf = E #restore E field
-
-    def two_lens_solve(self):
-        # assuming reference is recombined with the probe beam at the exit of the domain (should be changed)
-        self.interfere_ref_beam(10, 20)
-        ## 2 lens telescope, M = 1
-        r1 = travel(self.r0, self.L - self.focal_plane) #displace rays to lens. Accounts for object with depth
-
-        # propagate E field
-        self.propagate_E(r1, self.r0)
-        r2, self.Jf = circular_aperture(r1, self.R, E = self.Jf)    # cut off
-
-        r3 = sym_lens(r2, self.L/2)           # lens 1
-        self.propagate_E(r3, r2)
-
-        r4 = travel(r3, self.L*2)           # displace rays to lens 2.
-        self.propagate_E(r4, r3)
-
-        r5, self.Jf = circular_aperture(r4, self.R, E = self.Jf)    # cut off
-
-        r6 = sym_lens(r5, self.L/2)                             # lens 2
-        self.propagate_E(r6, r5)
-        
-        r7 = travel(r6, self.L)             # displace rays to detector
-        self.propagate_E(r7, r6)
-
-        self.rf = r7
-
-    def interferogram(self, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False):
         self.histogram_legacy(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem)
