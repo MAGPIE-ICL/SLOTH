@@ -408,10 +408,6 @@ class Diagnostic:
         self.histogram(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem, plain_plot = True)
 
 class Shadowgraphy(Diagnostic):
-    def solve(self):
-        # Backward-compatible default with legacy rtm_solver behaviour.
-        return self.two_lens_solve()
-
     """
     Example shadowgraphy diagnostic. Inherits from Rays, has custom solve method.
     Implements a two lens telescope with M = 1 and a single lens system with M = 2. Both lenses have a f = L/2 focal length, where L is a length scale specified when the class is initialized.
@@ -438,11 +434,6 @@ class Shadowgraphy(Diagnostic):
         self.rf = r7
     
 class Schlieren(Diagnostic):
-    def solve(self, mode = 'DF', R = 1):
-        if mode == 'LF':
-            return self.LF_solve(R = R)
-        return self.DF_solve(R = R)
-
     """
     Example dark field schlieren diagnostic. Inherits from Rays, has custom solve method.
     Implements a two lens telescope with M = 1. Both lenses have a f = L focal length, where L is a length scale specified when the class is initialized.
