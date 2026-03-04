@@ -30,7 +30,6 @@ from shared.propagation import back_propogate
 
 def omega_pe(ne):
     """Calculate electron plasma freq. Output units are rad/sec. From nrl pp 28"""
-
     return 5.64e4 * jnp.sqrt(ne)
 
 # NRL formulary inverse brems - cheers Jack Halliday for coding in Python
@@ -39,9 +38,7 @@ def kappa(ne, Te, Z, omega):
     # Useful subroutines
     def v_the(Te):
         """Calculate electron thermal speed. Provide Te in eV. Retrurns result in m/s"""
-
         return 4.19e5 * jnp.sqrt(Te)
-
     def V(ne, Te, Z, omega):
         o_pe = omega_pe(ne)
         #o_max = jnp.copy(o_pe)
@@ -50,21 +47,16 @@ def kappa(ne, Te, Z, omega):
         L_classical = Z * e / Te
         L_quantum = 2.760428269727312e-10 / jnp.sqrt(Te) # hbar / jnp.sqrt(m_e * e * Te)
         L_max = jnp.maximum(L_classical, L_quantum)
-
         #return o_max * L_max
         return o_pe * L_max
-
     def coloumbLog(ne, Te, Z, omega):
         return jnp.maximum(2.0, jnp.log(v_the(Te) / V(ne, Te, Z, omega)))
-
     ne_cc = ne * 1e-6
     # don't think this is actually used?
     #o_pe = omega_pe(ne_cc)
     CL = coloumbLog(ne_cc, Te, Z, omega)
-
     result = 3.1e-5 * Z * c * jnp.power(ne_cc / omega, 2) * CL * jnp.power(Te, -1.5) # 1/s
     del ne_cc
-
     return result
 
 # Plasma refractive index
@@ -275,7 +267,7 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
 
 def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = True, save_points_per_region = 2, memory_debug = False, lwl = 1064e-9, keep_domain = False, return_raw_results = False, verbose = True):
     
-    omega = 2 * jnp.pi * c / lwl
+    omega = 2 * jnp.pi * (c / lwl)
 
     region_count = ScalarDomain.region_count
     ray_batch_count = ScalarDomain.ray_batch_count

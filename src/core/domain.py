@@ -140,7 +140,7 @@ class ScalarDomain(eqx.Module):
         :raise AssertionError: If probing_direction is not == "x", "y" or "z".
 
         :return: Returns an equinox.Module inheriting object containing information about and the generated/imported domain itself.
-        :rtype: simulator.domain.ScalarDomain
+        :rtype: core.domain.ScalarDomain
         """
 
         ###
@@ -291,7 +291,7 @@ class ScalarDomain(eqx.Module):
 
             print("")
             if self.Np_total is not None:
-                import simulator.beam as ray_test_case
+                import core.beam as ray_test_case
 
                 test_beam = ray_test_case.Beam(1, 1, 1, 1)
                 single_ray = test_beam.s0 # just initialises 1 ray of any variety
@@ -502,7 +502,7 @@ class ScalarDomain(eqx.Module):
         Generate/import the selected electron density profile
 
         :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
+        :type self: core.domain.ScalarDomain object
 
         :raise AssertionError: If ne_type is changed from the default but not set to a valid type.
 
@@ -554,7 +554,7 @@ class ScalarDomain(eqx.Module):
         Null test, an empty cube
 
         :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
+        :type self: core.domain.ScalarDomain object
 
         :return: No return, exports the empty (zeroed) cubic domain as an attribute to the passed self object.
         :rtype: None
@@ -568,7 +568,7 @@ class ScalarDomain(eqx.Module):
         A slab with a linear gradient in x: n_e =  ne_0 * (1 + s * x / extent) - will cause a ray deflection in x
 
         :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
+        :type self: core.domain.ScalarDomain object
 
         :param s: scale factor
         :type s: float, default: 1
@@ -593,7 +593,7 @@ class ScalarDomain(eqx.Module):
         Linearly growing sinusoidal perturbation
 
         :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
+        :type self: core.domain.ScalarDomain object
 
         :param s1: scale of linear growth
         :type s1: float, default: 0.1
@@ -628,7 +628,7 @@ class ScalarDomain(eqx.Module):
         Exponentially growing/decaying sinusoidal perturbation
 
         :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
+        :type self: core.domain.ScalarDomain object
 
         :param ne_0: mean electron density
         :type ne_0: float, default: 1e24 m\ :sup:`-3`
@@ -673,7 +673,7 @@ class ScalarDomain(eqx.Module):
         Load externally generated MxMxM grid of electron density (ne) in m\ :sup:`-3`
 
         :param self: ScalarDomain object containing the domain to be generated's parameters.
-        :type self: simulator.domain.ScalarDomain object
+        :type self: core.domain.ScalarDomain object
 
         :return: No return, loads domain as an attribute to the self referenced object.
         :rtype: None
@@ -687,7 +687,7 @@ class ScalarDomain(eqx.Module):
         Export the current scalar electron density profile as a pvti file format, property added for future scalability to export temperature, B-field, etc.
 
         :param self: Part of the ScalarDomain class and thus takes in a self object.
-        :type self: simulator.domain.ScalarDomain
+        :type self: core.domain.ScalarDomain
 
         :param property: Sets the scalar field to export
         :type property: str (default = "ne")
@@ -772,9 +772,9 @@ class ScalarDomain(eqx.Module):
         Deallocates unused temporary meshgrid variables. Calls to shared.utils.dalloc(...)
 
         :param self: Part of the ScalarDomain class and thus takes in a self object.
-        :type self: simulator.domain.ScalarDomain
+        :type self: core.domain.ScalarDomain
 
-        :return: Updates the passed simulator.domain.ScalarDomain object.
+        :return: Updates the passed core.domain.ScalarDomain object.
         :rtype: None
         """
 
