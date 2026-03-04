@@ -98,11 +98,11 @@ def dsdt(t, s, parallelise, inv_brems, ne, x, y, z, omega, lengths, dims, edensi
 
     Args:
         t (float array): I think this is a dummy variable for ode_int - our problem is time invarient
-        s (9N float array): flattened 9xN array of rays used by ode_int
+        s (6N float array): flattened 6xN array of rays used by ode_int
         ScalarDomain (ScalarDomain): an ScalarDomain object which can calculate gradients
 
     Returns:
-        9N float array: flattened array for ode_int
+        6N float array: flattened array for ode_int
     """
 
     if not parallelise:
@@ -173,7 +173,7 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
     #    print("Ray tracer failed. This could be a case of diffrax exceeding max steps again due to apparent 'strictness' compared to solve_ivp, check error log.")
 
     #if sol.result == RESULTS.successful:
-    #rf = sol.ys[:, -1, :].reshape(9, Np)# / scalar
+    #rf = sol.ys[:, -1, :].reshape(6, Np)# / scalar
 
     if ray_batch_count > 1:
         # Concatenate time and state arrays

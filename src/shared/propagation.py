@@ -2,8 +2,6 @@ import jax.numpy as jnp
 
 # Need to backproject to ne volume, then find angles
 def ray_to_Jonesvector(rays, *, ne_extent = None, probing_direction = 'z', keep_current_plane = False):
-    # * forces keep_current_plane and return_E to be keyword-only arguments
-    # meaning .. return_E = True (missing out keep_current_plane) will work as it will not rely on position
     """
     Takes the output from the 6D solver and returns 4D rays for ray-transfer matrix techniques.
     Effectively finds how far the ray is from the end of the volume, returns it to the end of the volume.
