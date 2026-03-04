@@ -61,3 +61,14 @@ Why `RandomState` (not `default_rng`):
    - mean/std of deflection angles,
    - 5/50/95% quantiles.
 4. Confirm convergence with increasing `Np` and stable legacy-vs-refactor gaps.
+
+
+## Diagnostic-processing mismatch fixed
+
+A second mismatch source was identified in `src/processing/diagnostics.py`:
+- input rays were being pre-filtered by `lens_cutoff(...)` during object construction, before the legacy-equivalent diagnostic solve chain.
+- legacy `rtm_solver` applies optical cutoffs during solve stages, not as a mandatory constructor prefilter.
+
+This PR changes processing diagnostics to preserve legacy flow by default (`prefilter_input=False`) and only apply early prefiltering when explicitly requested.
+
+Compatibility helpers were also added so `solve()` defaults match legacy expectations for `Shadowgraphy`, `Schlieren`, and `Refractometry`.

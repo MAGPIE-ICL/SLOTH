@@ -9,6 +9,7 @@ from shared.propagation import ray_to_Jonesvector
 
 from shared.utils import count_nans
 from shared.utils import round_to_n
+from shared.printing import colour
 
 #import jax
 #jax.tree_util.tree_leaves(x, is_leaf = lambda x: x is None)
@@ -296,7 +297,7 @@ class Diagnostic:
     """
 
     # this is in mm's not metres - self.rf is converted to mm's (not sure if everything else is covered though)
-    def __init__(self, wavelength, rf, Jf = None, *, focal_plane = 0, L = 400, R = 25, Lx = 18, Ly = 13.5, x = None, y = None, x_l = None, y_l = None, l_x = 0, u_x = 0.3, l_y = -5, u_y = 5):
+    def __init__(self, wavelength, rf, Jf = None, *, focal_plane = 0, L = 400, R = 25, Lx = 18, Ly = 13.5, x = None, y = None, x_l = None, y_l = None, l_x = 0, u_x = 0.3, l_y = -5, u_y = 5, prefilter_input = False):
         """
         Initialise ray diagnostic.
 
@@ -330,17 +331,22 @@ class Diagnostic:
 
             self.Np = rf.shape[-1]
 
-            # masks rf (& Jf) to only hold entries corr. to rays that will be captured by the lense setup
-            # also forces matrices to type jax.Array via jnp.asarray()
-            
-            self.rf, self.Jf = lens_cutoff(rf, Jf, L = self.L, R = self.R)  # DO pass Jf to this, else self.Jf will be assigned None even if Jf is not None
-            
-            self.Np_inc = self.rf.shape[-1]
+            # Preserve legacy RTM behaviour by default: do not prefilter rays before
+            # diagnostic propagation. Early cutoff here can alter downstream optics and
+            # disagree with legacy workflows that apply apertures during solve().
+            self.rf = jnp.asarray(rf)
+            self.Jf = jnp.asarray(Jf) if Jf is not None else None
+
+            self.Np_inc = self.Np
+            if prefilter_input:
+                self.rf, self.Jf = lens_cutoff(self.rf, self.Jf, L = self.L, R = self.R)
+                self.Np_inc = self.rf.shape[-1]
+
             if self.Np == self.Np_inc:
-                print("\nAll rays incident on lens!")
+                print("\nAll rays retained at diagnostic input.")
             else:
-                print("\n{} rays received, {} incident on the first lens.".format(str(self.Np), str(self.Np_inc)))
-                print(" --> {} % of rays wasted!".format(str(round_to_n((1 - self.Np_inc / self.Np) * 100, 3))))
+                print("\n{} rays received, {} retained after optional prefilter.".format(str(self.Np), str(self.Np_inc)))
+                print(" --> {} % filtered before diagnostic solve.".format(str(round_to_n((1 - self.Np_inc / self.Np) * 100, 3))))
         else:
             assert "rf should not be of Noneype! diffrax clearly failed."
 
@@ -402,6 +408,10 @@ class Diagnostic:
         self.histogram(bin_scale = bin_scale, pix_x = pix_x, pix_y = pix_y, clear_mem = clear_mem, plain_plot = True)
 
 class Shadowgraphy(Diagnostic):
+    def solve(self):
+        # Backward-compatible default with legacy rtm_solver behaviour.
+        return self.two_lens_solve()
+
     """
     Example shadowgraphy diagnostic. Inherits from Rays, has custom solve method.
     Implements a two lens telescope with M = 1 and a single lens system with M = 2. Both lenses have a f = L/2 focal length, where L is a length scale specified when the class is initialized.
@@ -428,6 +438,11 @@ class Shadowgraphy(Diagnostic):
         self.rf = r7
     
 class Schlieren(Diagnostic):
+    def solve(self, mode = 'DF', R = 1):
+        if mode == 'LF':
+            return self.LF_solve(R = R)
+        return self.DF_solve(R = R)
+
     """
     Example dark field schlieren diagnostic. Inherits from Rays, has custom solve method.
     Implements a two lens telescope with M = 1. Both lenses have a f = L focal length, where L is a length scale specified when the class is initialized.
@@ -481,6 +496,9 @@ class Schlieren(Diagnostic):
         self.rf = r9
         
 class Refractometry(Diagnostic):
+    def solve(self):
+        return self.incoherent_solve()
+
     """
     Example of Imaging Refractometer. Inherits from Rays, has custom solve method.
     Implements a spherical lens with focal length f1 = L/2 and M = 2 for the spatial axis and a cylindrical lens
