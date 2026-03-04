@@ -1,10 +1,6 @@
 import numpy as np
 import jax.numpy as jnp
 
-from shared.utils import random_array
-from shared.utils import random_array_n
-from shared.utils import random_inv_pow_array
-
 from shared.printing import colour
 
 class Beam:
@@ -81,19 +77,40 @@ class Beam:
         from scipy.constants import c
 
         s0 = jnp.zeros((6, self.Np))
+
+        # Keep all random draws for one beam initialisation on the same RNG stream.
+        #
+        # Why this matters:
+        # - previous code called helper functions that each reset the global NumPy seed,
+        #   producing repeated/correlated sequences for t/u/phi/chi.
+        # - those correlations can make beam statistics vary non-physically when Np changes,
+        #   which is exactly the kind of discrepancy users reported.
+        #
+        # We mirror legacy behaviour by drawing successive arrays from one RNG state.
+        rng = np.random.RandomState(seed)
+
+        def rand(length):
+            return jnp.asarray(rng.rand(int(length)))
+
+        def randn(length):
+            return jnp.asarray(rng.randn(int(length)))
+
+        def rand_power(power, length):
+            return jnp.asarray(rng.power(power, int(length)))
+
         if(self.beam_type == 'circular'):
             from shared.utils import generic_valid_types as valid_types
             assert isinstance(self.beam_size, valid_types), "\nReceived beam_size of shape" + str(len(self.beam_size)) + "expected a float."
 
             # position, uniformly within a circle
-            t  = 2 * jnp.pi * random_array(self.Np, seed) #polar angle of position
+            t  = 2 * jnp.pi * rand(self.Np) #polar angle of position
 
             # inversely weights probability with radius so that positions are uniformly distributed
-            u = random_inv_pow_array(2, self.Np, seed) # radial coordinate of position
+            u = rand_power(2, self.Np) # radial coordinate of position
 
             # angle
-            ϕ = jnp.pi * random_array(self.Np) #azimuthal angle of velocity
-            χ = self.divergence * random_array_n(self.Np, seed) #polar angle of velocity
+            ϕ = jnp.pi * rand(self.Np) #azimuthal angle of velocity
+            χ = self.divergence * randn(self.Np) #polar angle of velocity
 
             if(self.probing_direction == 'x'):
                 # Initial velocity
@@ -131,12 +148,12 @@ class Beam:
             assert isinstance(self.beam_size, valid_types), "\nReceived beam_size of shape" + str(len(self.beam_size)) + "expected a float."
 
             # position, uniformly within a square
-            t  = 2 * random_array(self.Np, seed) - 1.0
-            u  = 2 * random_array(self.Np, seed) - 1.0
+            t  = 2 * rand(self.Np) - 1.0
+            u  = 2 * rand(self.Np) - 1.0
 
             # angle
-            ϕ = jnp.pi * random_array(self.Np, seed) #azimuthal angle of velocity
-            χ = self.divergence * random_array_n(self.Np, seed) #polar angle of velocity
+            ϕ = jnp.pi * rand(self.Np) #azimuthal angle of velocity
+            χ = self.divergence * randn(self.Np) #polar angle of velocity
 
             if(self.probing_direction == 'x'):
                 # Initial velocity
@@ -174,12 +191,12 @@ class Beam:
             assert size_dim == 2, colour.BOLD + "\nERROR: " + colour.END + "Must pass a list of length 2 to initialise a rectangular beam," + str(size_dim) + "item was passed."
 
             # position, uniformly within a square
-            t  = 2 * random_array(self.Np, seed) - 1.0
-            u  = 2 * random_array(self.Np, seed) - 1.0
+            t  = 2 * rand(self.Np) - 1.0
+            u  = 2 * rand(self.Np) - 1.0
 
             # angle
-            ϕ = jnp.pi * random_array(self.Np, seed) #azimuthal angle of velocity
-            χ = self.divergence * random_array_n(self.Np, seed) #polar angle of velocity
+            ϕ = jnp.pi * rand(self.Np) #azimuthal angle of velocity
+            χ = self.divergence * randn(self.Np) #polar angle of velocity
 
             beam_size_1 = self.beam_size[0] #m
             beam_size_2 = self.beam_size[1] #m
@@ -223,9 +240,9 @@ class Beam:
             assert isinstance(self.beam_size, valid_types), "\nReceived beam_size of shape" + str(len(self.beam_size)) + "expected a float."
 
             # position, uniformly along a line - probing direction is defaulted z, solved in x,z plane
-            t  = 2 * random_array(self.Np, seed) - 1.0
+            t  = 2 * rand(self.Np) - 1.0
             # angle
-            χ = self.divergence * random_array_n(self.Np, seed) #polar angle of velocity
+            χ = self.divergence * randn(self.Np) #polar angle of velocity
 
             # Initial velocity
             s0 = s0.at[3, :].set(c * jnp.sin(χ))
@@ -241,8 +258,8 @@ class Beam:
             self.Np = 3 * (num_of_circles + 1) * num_of_circles + 1 
 
             # angle
-            ϕ = jnp.pi * random_array(self.Np, seed) #azimuthal angle of velocity
-            χ = self.divergence * random_array_n(self.Np, seed) #polar angle of velocity
+            ϕ = jnp.pi * rand(self.Np) #azimuthal angle of velocity
+            χ = self.divergence * randn(self.Np) #polar angle of velocity
 
             # position, uniformly within a circle
             t = [0]
@@ -261,12 +278,12 @@ class Beam:
             # tracker_indices = jnp.random.choice(self.Np, N_trackers, replace=False)
 
             # position, uniformly within a square
-            t  = 2 * random_array(self.Np, seed) - 1.0
-            u  = 2 * random_array(self.Np, seed) - 1.0
+            t  = 2 * rand(self.Np) - 1.0
+            u  = 2 * rand(self.Np) - 1.0
 
             # angle
-            ϕ = jnp.pi * random_array(self.Np, seed) #azimuthal angle of velocity
-            χ = self.divergence * random_array_n(self.Np, seed) #polar angle of velocity
+            ϕ = jnp.pi * rand(self.Np) #azimuthal angle of velocity
+            χ = self.divergence * randn(self.Np) #polar angle of velocity
 
             beam_size_1 = self.beam_size[0] #m
             beam_size_2 = self.beam_size[1] #m
