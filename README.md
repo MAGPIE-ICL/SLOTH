@@ -1,38 +1,41 @@
 **SLOTH** stands for **Scalable Laser geometric Optics Tracer for HEDP**.
 
-This repository is a refactored, reduced-scope variant of `synthPy`, focused only on **geometric optics with refraction**.
+This repository currently contains a refactored geometric-optics ray tracing stack alongside legacy reference solvers.
 
 ## Scope
 
-SLOTH keeps:
-- Refraction-driven ray tracing (`n(x, y, z)` based media)
-- Minimal ray/state models
-- A small simulation pipeline for HEDP-focused use cases
-
-SLOTH intentionally removes:
-- Phase-contrast imaging physics
-- Faraday rotation / polarization effects
-- Non-essential diagnostics and post-processing modules unrelated to refraction
-- Monolithic multiphysics coupling interfaces
+Primary focus:
+- Refraction-driven ray tracing through scalar refractive/electron-density fields.
+- Beam generation, propagation, and diagnostics utilities.
+- Retention of legacy solver implementations for reference and parity checks.
 
 ## Repository layout
 
-- `src/sloth/models.py` — core data models (`Ray`, `RayBundle`, `Medium`)
-- `src/sloth/tracer.py` — refraction-only ray marcher
-- `src/sloth/api.py` — simple high-level simulation API
-- `tests/` — focused tests for refraction-only behavior
+- `src/core/` — main simulation building blocks (`domain`, `beam`, `propagator`, interpolator, config).
+- `src/shared/` — shared math/helpers and propagation transforms.
+- `src/legacy/` — legacy solver implementations used as behavioral reference.
+- `src/utils/` — I/O and analysis helpers.
+- `src/processing/` — diagnostic post-processing.
+- `examples/` — exploratory notebooks/scripts.
 
-## Quick start
+## Current project status
+
+- The repository does **not** yet include packaging metadata (`pyproject.toml`/`setup.py`).
+- The previous `pip install -e .` quick-start instructions are therefore not valid yet.
+
+## Running locally (current)
+
+Use the repository root on `PYTHONPATH` while iterating locally:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
-pytest
+pip install numpy scipy jax equinox
+export PYTHONPATH="$(pwd)/src:${PYTHONPATH}"
 ```
 
-## Design notes
+Then import modules such as `core.domain`, `core.beam`, and `core.propagator`.
 
-- The code path is intentionally narrow and explicit.
-- New features should align with the refraction-only mission.
-- If additional physics are needed, they should live in optional downstream extensions, not in SLOTH core.
+## Audit and improvement plan
+
+See `AUDIT.md` for current inconsistencies, risks, and prioritized improvements.
