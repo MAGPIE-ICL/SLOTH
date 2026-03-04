@@ -496,9 +496,6 @@ class Schlieren(Diagnostic):
         self.rf = r9
         
 class Refractometry(Diagnostic):
-    def solve(self):
-        return self.incoherent_solve()
-
     """
     Example of Imaging Refractometer. Inherits from Rays, has custom solve method.
     Implements a spherical lens with focal length f1 = L/2 and M = 2 for the spatial axis and a cylindrical lens
