@@ -26,6 +26,17 @@ import jax.numpy as jnp
 from scipy.constants import c, m_e, e, epsilon_0
 
 
+def _integration_end_time(trace_depth):
+    """Return the physical end-time of the ODE integration.
+
+    The propagator integrates from t = 0 to t = sqrt(8) * trace_depth / c.
+    The sqrt(8) safety factor ensures that rays have enough time to
+    traverse the domain even when refraction slows them down.
+    See propagator.solve() for the matching definition.
+    """
+    return float(np.sqrt(8.0) * trace_depth / c)
+
+
 def _make_quadratic_trough_domain(x_length, y_length, z_length,
                                    nx, ny, nz, ncr, yc):
     """Build a ScalarDomain whose electron density follows
@@ -118,7 +129,7 @@ def test_quadratic_trough_single_ray():
 
     # --- analytic solution at t_end ---
     trace_depth = probing_depth           # region_count == 1
-    t_end = float(np.sqrt(8.0) * trace_depth / c)
+    t_end = _integration_end_time(trace_depth)
     omega_y = c / (np.sqrt(2.0) * yc)
 
     x_ana = -x_length / 2.0 + vx0 * t_end
@@ -198,7 +209,7 @@ def test_quadratic_trough_multiple_rays():
     )
 
     trace_depth = probing_depth
-    t_end = float(np.sqrt(8.0) * trace_depth / c)
+    t_end = _integration_end_time(trace_depth)
     omega_y = c / (np.sqrt(2.0) * yc)
 
     pos_atol = 2e-4
