@@ -44,6 +44,7 @@ def _critical_density(lwl):
     return omega ** 2 * m_e * epsilon_0 / e ** 2
 
 def _f_analy(x, y0):
+    # See https://journals.aps.org/pre/pdf/10.1103/PhysRevE.61.895
     ne0 = (1.0 / 2.0) * (1.0 + y0 ** 2 / YC ** 2)
     vy0 = np.sqrt(1.-ne0)
     tau = 2.0*np.pi*YC/np.sqrt(0.5)
@@ -125,10 +126,6 @@ TOLERANCE_PRESETS = {
     "tight": Tolerances(
         pos_atol=5e-5,   # 0.05 mm
         pos_rtol=0.005,  # 0.5 %
-    ),
-    "relaxed": Tolerances(
-        pos_atol=1e-3,   # 1 mm – accommodates longer-wavelength runs
-        pos_rtol=0.05,   # 5 %
     ),
 }
 
