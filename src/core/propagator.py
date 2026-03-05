@@ -11,8 +11,7 @@ from sys import getsizeof as getsizeof_default
 # object type of diffrax output
 from diffrax import Solution
 
-from scipy.constants import c
-from scipy.constants import e
+import scipy.constants as sc
 from jax.scipy.interpolate import RegularGridInterpolator
 from shared.utils import getsizeof
 from shared.utils import mem_conversion
@@ -96,7 +95,7 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
     # although probably really unnecessary?
     del s
 
-    gradient_term = -0.5 * c ** 2 * ne / (3.14207787e-4 * omega ** 2)
+    gradient_term = - 0.5 * (sc.c / omega) ** 2 * ne / (sc.m_e * sc.epsilon_0 / sc.e ** 2)
 
     # must unpack x, y, z tuple here for the sake of dndr, could be earlier but this is easier to pass and more generalised
     # r must be transposed within dndr(...) else we get an AbstractTerm error due to the effect on the return value
@@ -222,9 +221,81 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
     else:
         assert "\nWhat."
 
+def solve_minimal(s0, domain, probing_depth, lwl, *, save_points = 2, rtol = 1e-3, atol = 1e-5):
+    """
+    Minimal diffrax-based ray-trace solver.
+
+    Takes a (6, Np) state matrix and a ScalarDomain, propagates all rays
+    through the domain using vmap + diffrax, and returns the raw diffrax
+    Solution object directly.
+
+    Args:
+        s0 (jax.Array): Initial ray state matrix of shape (6, Np).
+                         Rows 0-2 are position (x, y, z), rows 3-5 are velocity.
+        domain: A ScalarDomain object (must expose .ne, .x, .y, .z, .lengths).
+        probing_depth (float): Physical depth to trace through (same units as domain lengths).
+        lwl (float): Laser wavelength in metres.  Default 1064 nm.
+        save_points (int): Number of time-slices to save (≥2). Default 2 (start & end).
+        rtol (float): Relative tolerance for the adaptive stepper.
+        atol (float): Absolute tolerance for the adaptive stepper.
+
+    Returns:
+        diffrax.Solution: The vmapped solution whose ``.ys`` has shape
+                          (Np, save_points, 6).
+    """
+    from diffrax import ODETerm, Tsit5, SaveAt, PIDController, diffeqsolve
+    from equinox import filter_jit
+
+    omega = 2.0 * jnp.pi * (sc.c / lwl)
+
+    # Time span: sqrt(8) safety factor so rays have time to exit the box
+    t_end = jnp.sqrt(8.0) * probing_depth / sc.c
+    norm_factor = t_end  # normalise to [0, 1] for diffrax
+
+    # Build args tuple matching dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims)
+    args = (
+        True,           # parallelise (always True for vmap path)
+        domain.ne,
+        domain.x, domain.y, domain.z,
+        omega,
+        domain.lengths, domain.dims,
+    )
+
+    def dsdt_normed(t, y, args):
+        return dsdt(t, y, *args) * norm_factor
+
+    term = ODETerm(dsdt_normed)
+    solver = Tsit5()
+    saveat = SaveAt(ts = jnp.linspace(0.0, 1.0, save_points))
+    stepsize_controller = PIDController(rtol = rtol, atol = atol)
+
+    def _solve_single(s0_single, args):
+        return diffeqsolve(
+            term,
+            solver,
+            y0 = jnp.array(s0_single),
+            args = args,
+            t0 = 0.0,
+            t1 = 1.0,
+            dt0 = None,
+            saveat = saveat,
+            stepsize_controller = stepsize_controller,
+            max_steps = int(2e8),
+        )
+
+    _solve_jit = filter_jit(_solve_single)
+
+    # s0 is (6, Np) — transpose to (Np, 6) for vmap over leading axis
+    sol = jax.block_until_ready(
+        jax.vmap(_solve_jit, in_axes = (0, None))(s0.T, args)
+    )
+
+    return sol
+
+
 def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = True, save_points_per_region = 2, memory_debug = False, lwl = 1064e-9, keep_domain = False, return_raw_results = False, verbose = True):
     
-    omega = 2 * jnp.pi * (c / lwl)
+    omega = 2 * jnp.pi * (sc.c / lwl)
 
     region_count = ScalarDomain.region_count
     ray_batch_count = ScalarDomain.ray_batch_count
@@ -373,7 +444,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             # at end positions are r(vector) + trace_depth (ish) NOT trace_depth(vector)
             print(" --> tracing a depth of", trace_depth, "mm's to the target depth of", target_depth, "mm's")
 
-            t = jnp.linspace(0.0, jnp.sqrt(8.0) * trace_depth / c, 2)
+            t = jnp.linspace(0.0, jnp.sqrt(8.0) * trace_depth / sc.c, 2)
             norm_factor = jnp.max(t)
 
             # 8.0^0.5 is an arbritrary factor to ensure rays have enough time to escape the box
@@ -464,7 +535,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
                 # using lengths and/or dims to set parameters of diffeqsolve(...) results in BooleanConversionError due to tracing variable resolution
                 # rtol & atol are good here - setting too precise increases runtime dramatically for little change in results, it overcompensates
-                def diffrax_solve(dydt, t0, t1, Nt, lengths, dims, *, rtol = 1, atol = 1e-5):
+                def diffrax_solve(dydt, t0, t1, Nt, lengths, dims, *, rtol = 1e-3, atol = 1e-5):
                     """
                     Here we wrap the diffrax diffeqsolve function such that we can easily parallelise it
                     """
