@@ -152,7 +152,7 @@ class Rays:
         self.E, self.focal_plane, self.L, self.R, self.Lx, self.Ly = E, focal_plane, L, R, Lx, Ly
         self.r0 = m_to_mm(r0)
 
-    def histogram(self, bin_scale=10, pix_x=3448, pix_y=2574, clear_mem=False):
+    def histogram(self, bin_scale=1, pix_x=3448, pix_y=2574, clear_mem=False):
         """Bin data into a histogram. Defaults are for a KAF-8300.
         Outputs are H, the histogram, and xedges and yedges, the bin edges.
 

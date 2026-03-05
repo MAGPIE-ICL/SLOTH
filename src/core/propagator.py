@@ -32,37 +32,9 @@ def omega_pe(ne):
     """Calculate electron plasma freq. Output units are rad/sec. From nrl pp 28"""
     return 5.64e4 * jnp.sqrt(ne)
 
-# NRL formulary inverse brems - cheers Jack Halliday for coding in Python
-# Converted to rate coefficient by multiplying by group velocity in plasma
-def kappa(ne, Te, Z, omega):
-    # Useful subroutines
-    def v_the(Te):
-        """Calculate electron thermal speed. Provide Te in eV. Retrurns result in m/s"""
-        return 4.19e5 * jnp.sqrt(Te)
-    def V(ne, Te, Z, omega):
-        o_pe = omega_pe(ne)
-        #o_max = jnp.copy(o_pe)
-        #o_max[o_pe < omega] = omega
-        o_pe = o_pe.at[:, :].set(jnp.where(o_pe < omega, omega, o_pe))
-        L_classical = Z * e / Te
-        L_quantum = 2.760428269727312e-10 / jnp.sqrt(Te) # hbar / jnp.sqrt(m_e * e * Te)
-        L_max = jnp.maximum(L_classical, L_quantum)
-        #return o_max * L_max
-        return o_pe * L_max
-    def coloumbLog(ne, Te, Z, omega):
-        return jnp.maximum(2.0, jnp.log(v_the(Te) / V(ne, Te, Z, omega)))
-    ne_cc = ne * 1e-6
-    # don't think this is actually used?
-    #o_pe = omega_pe(ne_cc)
-    CL = coloumbLog(ne_cc, Te, Z, omega)
-    result = 3.1e-5 * Z * c * jnp.power(ne_cc / omega, 2) * CL * jnp.power(Te, -1.5) # 1/s
-    del ne_cc
-    return result
-
 # Plasma refractive index
 def n_refrac(ne, omega):
     return jnp.sqrt(1.0 - (omega_pe(ne * 1e-6) / omega) ** 2)
-
 
 def dndr(r, gradient_term, omega, x, y, z):
     """
@@ -92,7 +64,7 @@ def dndr(r, gradient_term, omega, x, y, z):
     return grad
 
 # ODEs of photon paths, standalone function to support the solve()
-def dsdt(t, s, parallelise, inv_brems, ne, x, y, z, omega, lengths, dims, edensity, refrac_field):
+def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
     """
     Returns an array with the gradients and velocity per ray for ode_int
 
@@ -126,10 +98,7 @@ def dsdt(t, s, parallelise, inv_brems, ne, x, y, z, omega, lengths, dims, edensi
     # although probably really unnecessary?
     del s
 
-    if edensity is True:
-        gradient_term = -0.5 * c ** 2 * ne / (3.14207787e-4 * omega ** 2)
-    else:
-        gradient_term = 0.5 * c ** 2 * refrac_field ** 2
+    gradient_term = -0.5 * c ** 2 * ne / (3.14207787e-4 * omega ** 2)
 
     # must unpack x, y, z tuple here for the sake of dndr, could be earlier but this is easier to pass and more generalised
     # r must be transposed within dndr(...) else we get an AbstractTerm error due to the effect on the return value
@@ -139,16 +108,6 @@ def dsdt(t, s, parallelise, inv_brems, ne, x, y, z, omega, lengths, dims, edensi
     ###
     ### Sort out passed functions and objects
     ###
-
-    # Attenuation due to inverse bremsstrahlung
-    if inv_brems:
-        print("inv_brems")
-        sprime = sprime.at[6, :].set(trilinearInterpolator((x, y, z), kappa(ne, Te, Z, omega), r) * amp)
-
-    ##
-    ## Commented out code is previous version - this was apparently causing floating point errors (Alan did not specify what/how)
-    ## Second form of this is the expansion of the n_refrac() function directly into calculation
-    ##
 
     # Keep derivative shape consistent with solver state shape (flattened 1D state vector).
     return jnp.ravel(sprime)
@@ -355,11 +314,6 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
                     ne_type = ScalarDomain.ne_type
 
-                    refrac_field = ScalarDomain.refrac_field
-
-                    inv_brems = ScalarDomain.inv_brems
-                    edensity = ScalarDomain.edensity
-
                     probing_direction = ScalarDomain.probing_direction
 
                     region_count = ScalarDomain.region_count
@@ -378,9 +332,6 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     ScalarDomain = d.ScalarDomain(
                         lengths, dims,
                         ne_type = ne_type,
-                        refrac_field = refrac_field,
-                        inv_brems = inv_brems,
-                        edensity = edensity,
                         probing_direction = probing_direction,
                         auto_batching = True,
                         iteration = i,
@@ -395,11 +346,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
                     del ne_type
 
-                    del refrac_field
                     del densities
-
-                    del inv_brems
-                    del edensity
 
                     del probing_direction
 
@@ -436,12 +383,11 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
             # passed args must be hashable to be made static for jax.jit, tuple is hashable, array & dict are not
             args = (
-                parallelise, ScalarDomain.inv_brems, 
+                parallelise, 
                 ScalarDomain.ne,
                 ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
                 omega, 
-                ScalarDomain.lengths, ScalarDomain.dims,
-                ScalarDomain.edensity, ScalarDomain.refrac_field
+                ScalarDomain.lengths, ScalarDomain.dims
             )
 
             ###

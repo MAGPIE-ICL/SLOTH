@@ -37,7 +37,6 @@ def ray_to_Jonesvector(rays, *, ne_extent = None, probing_direction = 'z', keep_
         # Positions on plane
         if not keep_current_plane:
             t_bp = (x - ne_extent) / vx
-
             ray_p = ray_p.at[0].set(y - vy * t_bp)
             ray_p = ray_p.at[2].set(z - vz * t_bp)
         else:

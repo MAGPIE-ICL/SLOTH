@@ -213,8 +213,10 @@ def jax_init(force_device = None, core_limit = None, extra_info = False, disable
     # enables float data types to use 64-bit instead of 32 for greater precision
     # currently disabled by default as greater precision will vastly increase run times
     if enable_x64:
-        print("\nWARNING: x64 bit currently disabled by default as greater precision will vastly increase run times")
+        print("\nWARNING: x64 bit currently enabled")
         jax.config.update('jax_enable_x64', True)
+    else:
+        print("\nWARNING: x64 bit currently disabled by default as greater precision will vastly increase run times")
 
     if debugging:
         jax.config.update('jax_traceback_filtering', 'off')

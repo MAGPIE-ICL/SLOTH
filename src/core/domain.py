@@ -33,9 +33,6 @@ class ScalarDomain(eqx.Module):
 
     ne_0: jnp.float32
 
-    inv_brems: bool
-    edensity: bool
-
     probing_direction: str
 
     ne_type: str
@@ -79,10 +76,8 @@ class ScalarDomain(eqx.Module):
     Np_total: np.int64
     ray_batch_count: np.int64
 
-    refrac_field: jax.Array
-
-    def __init__(self, lengths, dims, *, ne_type = None, inv_brems = False, probing_direction = 'z', auto_batching = True, iteration = 1, region_count = 1, leeway_factor = None, coord_backup = None, future_dims = None, extra_info = False, memory_reporting = False, memory_limit = None, Np = None,
-        s = None, s1 = None, s2 = None, Ly = None, ne_0 = None, ne = None, edensity = True, refrac_field = None):
+    def __init__(self, lengths, dims, *, ne_type = None, probing_direction = 'z', auto_batching = True, iteration = 1, region_count = 1, leeway_factor = None, coord_backup = None, future_dims = None, extra_info = False, memory_reporting = False, memory_limit = None, Np = None,
+        s = None, s1 = None, s2 = None, Ly = None, ne_0 = None, ne = None):
         """
         A class to set-up/generate the scalar simulation domains and store for later use.
 
@@ -95,9 +90,6 @@ class ScalarDomain(eqx.Module):
 
         :param ne_type: Sets the type of domain for the class functions to allocate.
         :type ne_type: str or None
-
-        :param inv_brems: Disables python multithreading to prevent conflict with jax parallelisation in some instances.
-        :type inv_brems: bool (default = True)
 
         :param probing_direction: Set's the direction the beam is propagating in.
         :type probing_direction: char (default = 'z')
@@ -147,12 +139,6 @@ class ScalarDomain(eqx.Module):
         ### Can some of these flags be moved to propagator.py instead?
         ###
 
-        # Logical switches
-        self.inv_brems = inv_brems
-        del inv_brems
-        self.edensity = edensity
-        del edensity
-
         # initalise
         self.s = s
         del s
@@ -172,21 +158,9 @@ class ScalarDomain(eqx.Module):
         self.ne = ne
         del ne
 
-        if self.edensity == True and refrac_field is not None:
-            print(colour.BOLD + "\nBy setting edensity == True, refrac_field will not be used. If this is intended, we suggest you do not pass this value in future." + colour.END)
-            print(" --> Overriding self.refrac_field entry to None")
-
-            self.refrac_field = None
-        else:
-            self.refrac_field = refrac_field
-        del refrac_field
-
         self.probing_direction = probing_direction
 
         self.ne_type = ne_type
-
-        assert (self.edensity == True and (self.ne is not None or self.ne_type is not None)), "\nMust pass either a pre-generated field or a type of field to generate."
-        assert not (self.edensity == False and self.refrac_field is not None), "\nIf edensity == False, refrac_field must be supplied."
 
         # working with 10% leeway in estimate for now
         if leeway_factor is not None:
@@ -252,7 +226,7 @@ class ScalarDomain(eqx.Module):
         predicted_domain_allocation = domain_estimate(self.x_n, self.y_n, self.z_n)
         print("Predicted size in memory of domain:", mem_conversion(predicted_domain_allocation))
 
-        if iteration == 1 and auto_batching and self.edensity == True:
+        if iteration == 1 and auto_batching:
             memory_stats = memory_report(memory_limit = memory_limit)
 
             print("\nMemory prior to domain creation:")
@@ -275,10 +249,6 @@ class ScalarDomain(eqx.Module):
             allocation_count = 2
 
             # up to +5 in calc_dndr(...) depending on the number of extra interps
-            if self.inv_brems:
-                # unsure how many intermediaries exist at peak mem usage for this allocation - need to check and adjust this
-                allocation_count += 1
-                
             # compare to max allocation in domain setup and return the greatest
             if self.ne_type == "test_null" or self.ne_type == "test_slab" or self.ne_type == "test_B":
                 allocation_count = max(allocation_count, 2)
