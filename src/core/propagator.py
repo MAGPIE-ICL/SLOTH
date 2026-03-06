@@ -466,7 +466,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
                 # using lengths and/or dims to set parameters of diffeqsolve(...) results in BooleanConversionError due to tracing variable resolution
                 # rtol & atol are good here - setting too precise increases runtime dramatically for little change in results, it overcompensates
-                def diffrax_solve(dydt, t0, t1, Nt, lengths, dims, *, rtol = 1, atol = 1e-5):
+                def diffrax_solve(dydt, t0, t1, Nt, lengths, dims, *, rtol = 1e-3, atol = 1e-5):
                     """
                     Here we wrap the diffrax diffeqsolve function such that we can easily parallelise it
                     """
