@@ -176,7 +176,7 @@ def test_single_ray(lwl, tol_name):
     Parametrized over wavelength (351 nm, 702 nm, 1053 nm) and tolerance
     level (tight, standard, relaxed).
     """
-    from core.propagator import solve_minimal
+    from core.propagator import Propagator
 
     ncr = _critical_density(lwl)
     tol = TOLERANCE_PRESETS[tol_name]
@@ -192,7 +192,8 @@ def test_single_ray(lwl, tol_name):
 
     s0 = _make_ray(-X_LENGTH / 2.0, y0, vx0)
 
-    sol = solve_minimal(s0, domain, PROBING_DEPTH, lwl=lwl)
+    prop = Propagator(domain, PROBING_DEPTH, lwl)
+    sol = prop(s0)
 
     final = np.asarray(sol.ys[0, -1, :])
     x_num, y_num = float(final[0]), float(final[1])
@@ -226,7 +227,7 @@ def test_multiple_rays(lwl, tol_name):
 
     Parametrized over wavelength and tolerance level.
     """
-    from core.propagator import solve_minimal
+    from core.propagator import Propagator
 
     ncr = _critical_density(lwl)
     tol = TOLERANCE_PRESETS[tol_name]
@@ -244,7 +245,8 @@ def test_multiple_rays(lwl, tol_name):
         s0 = s0.at[1, j].set(y0)
         s0 = s0.at[3, j].set(c * n_y0)
 
-    sol = solve_minimal(s0, domain, PROBING_DEPTH, lwl=lwl)
+    prop = Propagator(domain, PROBING_DEPTH, lwl)
+    sol = prop(s0)
 
     for j, y0 in enumerate(Y0_VALUES):
         final = np.asarray(sol.ys[j, -1, :])

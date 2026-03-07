@@ -4,6 +4,8 @@ import numpy as np
 
 import os
 
+import equinox as eqx
+
 from scipy.integrate import odeint, solve_ivp
 from time import time
 from sys import getsizeof as getsizeof_default
@@ -23,17 +25,215 @@ from core.interpolator import RegularGridInterpolator as trilinearInterpolator
 from shared.propagation import ray_to_Jonesvector
 from shared.propagation import back_propogate
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Propagator – eqx.Module class-based solver
+# ──────────────────────────────────────────────────────────────────────
+
+class Propagator(eqx.Module):
+    """Equinox module wrapping the diffrax ray-trace solver.
+
+    Stores the electron-density field, grid coordinates, and all solver
+    parameters as JAX-compatible fields so the entire object can be
+    passed through ``jax.jit`` / ``jax.vmap`` without issues.
+
+    Usage::
+
+        prop = Propagator(domain, probing_depth=0.10, lwl=351e-9)
+        sol  = prop(s0)          # s0 shape: (6, Np)
+        # sol.ys has shape (Np, save_points, 6)
+    """
+
+    # Domain fields
+    ne: jax.Array
+    x: jax.Array
+    y: jax.Array
+    z: jax.Array
+    lengths: jax.Array
+    dims: jax.Array
+
+    # Physical / solver scalars
+    omega: float
+    norm_factor: float
+    rtol: float
+    atol: float
+    save_points: int
+    max_steps: int
+
+    def __init__(self, domain, probing_depth, lwl, *,
+                 save_points=2, rtol=1e-3, atol=1e-5, max_steps=int(2e8)):
+        """
+        Args:
+            domain: A ScalarDomain (must expose .ne, .x, .y, .z, .lengths, .dims).
+            probing_depth (float): Physical depth to trace (metres).
+            lwl (float): Laser wavelength (metres).
+            save_points (int): Number of time-slices to save (≥2).
+            rtol (float): Relative tolerance for adaptive stepper.
+            atol (float): Absolute tolerance for adaptive stepper.
+            max_steps (int): Maximum number of integration steps.
+        """
+        self.ne = domain.ne
+        self.x = domain.x
+        self.y = domain.y
+        self.z = domain.z
+        self.lengths = domain.lengths
+        self.dims = domain.dims
+
+        self.omega = 2.0 * jnp.pi * (sc.c / lwl)
+
+        # sqrt(8) safety factor so rays have time to exit the box
+        t_end = jnp.sqrt(8.0) * probing_depth / sc.c
+        self.norm_factor = float(t_end)
+
+        self.rtol = rtol
+        self.atol = atol
+        self.save_points = save_points
+        self.max_steps = max_steps
+
+    # ── static helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def omega_pe(ne):
+        """Electron plasma frequency (rad/s).  NRL formulary p 28."""
+        return 5.64e4 * jnp.sqrt(ne)
+
+    @staticmethod
+    def n_refrac(ne, omega):
+        """Plasma refractive index."""
+        return jnp.sqrt(1.0 - (Propagator.omega_pe(ne * 1e-6) / omega) ** 2)
+
+    @staticmethod
+    def dndr(r, gradient_term, omega, x, y, z):
+        """Gradient of the refractive-index term at positions *r*.
+
+        Args:
+            r: (N, 3) position array.
+            gradient_term: 3-D array of -0.5 c²  ne / (mₑ ε₀ / e²) / ω².
+            omega: laser angular frequency.
+            x, y, z: 1-D coordinate arrays of the domain grid.
+
+        Returns:
+            (3, N) gradient array.
+        """
+        grad = jnp.zeros_like(r.T)
+
+        dndx = jnp.gradient(gradient_term, x, axis=0)
+        grad = grad.at[0, :].set(trilinearInterpolator((x, y, z), dndx, r, fill_value=0.0))
+        del dndx
+
+        dndy = jnp.gradient(gradient_term, y, axis=1)
+        grad = grad.at[1, :].set(trilinearInterpolator((x, y, z), dndy, r, fill_value=0.0))
+        del dndy
+
+        dndz = jnp.gradient(gradient_term, z, axis=2)
+        grad = grad.at[2, :].set(trilinearInterpolator((x, y, z), dndz, r, fill_value=0.0))
+        del dndz
+
+        return grad
+
+    @staticmethod
+    def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
+        """ODE right-hand side for photon ray equations.
+
+        Args:
+            t: time (unused — the problem is time-invariant).
+            s: flattened 6×N state vector (or 6-vector when parallelised).
+            parallelise: if True, reshape to (6, 1) for the vmap path.
+            ne, x, y, z: electron density field and grid coordinates.
+            omega: laser angular frequency.
+            lengths, dims: domain size / resolution (unused inside, kept for
+                           interface compatibility with the legacy solver).
+
+        Returns:
+            Flattened derivative vector matching *s*.
+        """
+        if not parallelise:
+            s = jnp.reshape(s, (6, s.size // 6))
+        else:
+            s = jnp.reshape(s, (6, 1))
+
+        sprime = jnp.zeros_like(s)
+
+        r = s[:3, :].T
+        v = s[3:6, :]
+        del s
+
+        gradient_term = -0.5 * (sc.c / omega) ** 2 * ne / (sc.m_e * sc.epsilon_0 / sc.e ** 2)
+
+        sprime = sprime.at[3:6, :].set(Propagator.dndr(r, gradient_term, omega, x, y, z))
+        sprime = sprime.at[:3, :].set(v)
+
+        return jnp.ravel(sprime)
+
+    # ── __call__  (replaces solve_minimal) ────────────────────────────
+
+    def __call__(self, s0):
+        """Propagate rays through the domain.
+
+        Args:
+            s0 (jax.Array): Initial state matrix of shape (6, Np).
+                             Rows 0-2 are position (x, y, z), rows 3-5 velocity.
+
+        Returns:
+            diffrax.Solution whose ``.ys`` has shape (Np, save_points, 6).
+        """
+        from diffrax import ODETerm, Tsit5, SaveAt, PIDController, diffeqsolve
+        from equinox import filter_jit
+
+        args = (
+            True,           # parallelise (always True for vmap path)
+            self.ne,
+            self.x, self.y, self.z,
+            self.omega,
+            self.lengths, self.dims,
+        )
+
+        norm_factor = self.norm_factor
+
+        def dsdt_normed(t, y, args):
+            return Propagator.dsdt(t, y, *args) * norm_factor
+
+        term = ODETerm(dsdt_normed)
+        solver = Tsit5()
+        saveat = SaveAt(ts=jnp.linspace(0.0, 1.0, self.save_points))
+        stepsize_controller = PIDController(rtol=self.rtol, atol=self.atol)
+
+        max_steps = self.max_steps
+
+        def _solve_single(s0_single, args):
+            return diffeqsolve(
+                term,
+                solver,
+                y0=jnp.array(s0_single),
+                args=args,
+                t0=0.0,
+                t1=1.0,
+                dt0=None,
+                saveat=saveat,
+                stepsize_controller=stepsize_controller,
+                max_steps=max_steps,
+            )
+
+        _solve_jit = filter_jit(_solve_single)
+
+        sol = jax.block_until_ready(
+            jax.vmap(_solve_jit, in_axes=(0, None))(s0.T, args)
+        )
+
+        return sol
+
+
 ##
-## Helper functions for calculations
+## Helper functions for calculations (kept as module-level for backward compat)
 ##
 
 def omega_pe(ne):
     """Calculate electron plasma freq. Output units are rad/sec. From nrl pp 28"""
-    return 5.64e4 * jnp.sqrt(ne)
+    return Propagator.omega_pe(ne)
 
 # Plasma refractive index
 def n_refrac(ne, omega):
-    return jnp.sqrt(1.0 - (omega_pe(ne * 1e-6) / omega) ** 2)
+    return Propagator.n_refrac(ne, omega)
 
 def dndr(r, gradient_term, omega, x, y, z):
     """
@@ -45,22 +245,7 @@ def dndr(r, gradient_term, omega, x, y, z):
     Returns:
         3 x N float: N [dx, dy, dz] electron density gradients
     """
-
-    grad = jnp.zeros_like(r.T)
-
-    dndx = jnp.gradient(gradient_term, x, axis = 0)
-    grad = grad.at[0, :].set(trilinearInterpolator((x, y, z), dndx, r, fill_value = 0.0))
-    del dndx
-
-    dndy = jnp.gradient(gradient_term, y, axis = 1)
-    grad = grad.at[1, :].set(trilinearInterpolator((x, y, z), dndy, r, fill_value = 0.0))
-    del dndy
-
-    dndz = jnp.gradient(gradient_term, z, axis = 2)
-    grad = grad.at[2, :].set(trilinearInterpolator((x, y, z), dndz, r, fill_value = 0.0))
-    del dndz
-
-    return grad
+    return Propagator.dndr(r, gradient_term, omega, x, y, z)
 
 # ODEs of photon paths, standalone function to support the solve()
 def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
@@ -75,39 +260,7 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
     Returns:
         6N float array: flattened array for ode_int
     """
-
-    if not parallelise:
-        # jnp.reshape() auto converts to a jax array rather than having to do after a numpy reshape
-        s = jnp.reshape(s, (6, s.size // 6))
-    else:
-        # forces s to be a matrix even if has the indexes of a 1d array such that dsdt() can be generalised
-        s = jnp.reshape(s, (6, 1))  # one ray per vmap iteration if parallelised
-
-    sprime = jnp.zeros_like(s)
-
-    # Position and velocity
-    # needs to be before the reshape to avoid indexing errors
-    r = s[:3, :].T  # transposed so it is of the correct shape for interpolators
-    v = s[3:6, :]
-
-    # was deleting before it needed using before by accident - obviously caused issues (AbstractTerm error)
-    # - fine to delete after used, only one slice of s0 rather than deleting s0
-    # although probably really unnecessary?
-    del s
-
-    gradient_term = - 0.5 * (sc.c / omega) ** 2 * ne / (sc.m_e * sc.epsilon_0 / sc.e ** 2)
-
-    # must unpack x, y, z tuple here for the sake of dndr, could be earlier but this is easier to pass and more generalised
-    # r must be transposed within dndr(...) else we get an AbstractTerm error due to the effect on the return value
-    sprime = sprime.at[3:6, :].set(dndr(r, gradient_term, omega, x, y, z))
-    sprime = sprime.at[:3, :].set(v)
-
-    ###
-    ### Sort out passed functions and objects
-    ###
-
-    # Keep derivative shape consistent with solver state shape (flattened 1D state vector).
-    return jnp.ravel(sprime)
+    return Propagator.dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims)
    
 def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose):
     """
@@ -222,75 +375,14 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
         assert "\nWhat."
 
 def solve_minimal(s0, domain, probing_depth, lwl, *, save_points = 2, rtol = 1e-3, atol = 1e-5):
+    """Convenience wrapper around :class:`Propagator`.
+
+    Kept for backward compatibility — constructs a ``Propagator`` and
+    calls it immediately.  New code should use ``Propagator`` directly.
     """
-    Minimal diffrax-based ray-trace solver.
-
-    Takes a (6, Np) state matrix and a ScalarDomain, propagates all rays
-    through the domain using vmap + diffrax, and returns the raw diffrax
-    Solution object directly.
-
-    Args:
-        s0 (jax.Array): Initial ray state matrix of shape (6, Np).
-                         Rows 0-2 are position (x, y, z), rows 3-5 are velocity.
-        domain: A ScalarDomain object (must expose .ne, .x, .y, .z, .lengths).
-        probing_depth (float): Physical depth to trace through (same units as domain lengths).
-        lwl (float): Laser wavelength in metres.  Default 1064 nm.
-        save_points (int): Number of time-slices to save (≥2). Default 2 (start & end).
-        rtol (float): Relative tolerance for the adaptive stepper.
-        atol (float): Absolute tolerance for the adaptive stepper.
-
-    Returns:
-        diffrax.Solution: The vmapped solution whose ``.ys`` has shape
-                          (Np, save_points, 6).
-    """
-    from diffrax import ODETerm, Tsit5, SaveAt, PIDController, diffeqsolve
-    from equinox import filter_jit
-
-    omega = 2.0 * jnp.pi * (sc.c / lwl)
-
-    # Time span: sqrt(8) safety factor so rays have time to exit the box
-    t_end = jnp.sqrt(8.0) * probing_depth / sc.c
-    norm_factor = t_end  # normalise to [0, 1] for diffrax
-
-    # Build args tuple matching dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims)
-    args = (
-        True,           # parallelise (always True for vmap path)
-        domain.ne,
-        domain.x, domain.y, domain.z,
-        omega,
-        domain.lengths, domain.dims,
-    )
-
-    def dsdt_normed(t, y, args):
-        return dsdt(t, y, *args) * norm_factor
-
-    term = ODETerm(dsdt_normed)
-    solver = Tsit5()
-    saveat = SaveAt(ts = jnp.linspace(0.0, 1.0, save_points))
-    stepsize_controller = PIDController(rtol = rtol, atol = atol)
-
-    def _solve_single(s0_single, args):
-        return diffeqsolve(
-            term,
-            solver,
-            y0 = jnp.array(s0_single),
-            args = args,
-            t0 = 0.0,
-            t1 = 1.0,
-            dt0 = None,
-            saveat = saveat,
-            stepsize_controller = stepsize_controller,
-            max_steps = int(2e8),
-        )
-
-    _solve_jit = filter_jit(_solve_single)
-
-    # s0 is (6, Np) — transpose to (Np, 6) for vmap over leading axis
-    sol = jax.block_until_ready(
-        jax.vmap(_solve_jit, in_axes = (0, None))(s0.T, args)
-    )
-
-    return sol
+    prop = Propagator(domain, probing_depth, lwl,
+                      save_points=save_points, rtol=rtol, atol=atol)
+    return prop(s0)
 
 
 def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = True, save_points_per_region = 2, memory_debug = False, lwl = 1064e-9, keep_domain = False, return_raw_results = False, verbose = True):
