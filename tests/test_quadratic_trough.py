@@ -55,31 +55,21 @@ def _f_analy(x, y0):
 # ---------------------------------------------------------------------------
 
 def _make_quadratic_trough_domain(x_length, y_length, z_length,
-                                   nx, ny, nz, ncr, yc):
-    """Build a ScalarDomain whose electron density follows
-    ne(y) = ncr/2 * (1 + y^2 / yc^2)."""
-    from core.domain import ScalarDomain
+                                   nx, ny, nz, ncr, yc, lwl):
+    """Build a Domain whose refractive index corresponds to the quadratic
+    electron density profile ne(y) = ncr/2 * (1 + y^2 / yc^2)."""
+    from core.domain import Domain
 
     lengths = jnp.array([x_length, y_length, z_length])
     dims = jnp.array([nx, ny, nz])
 
+    x = jnp.linspace(-x_length / 2, x_length / 2, nx)
     y = jnp.linspace(-y_length / 2, y_length / 2, ny)
-    _, YY, _ = jnp.meshgrid(
-        jnp.linspace(-x_length / 2, x_length / 2, nx),
-        y,
-        jnp.linspace(-z_length / 2, z_length / 2, nz),
-        indexing='ij',
-    )
+    z = jnp.linspace(-z_length / 2, z_length / 2, nz)
+    _, YY, _ = jnp.meshgrid(x, y, z, indexing='ij')
     ne = (ncr / 2.0) * (1.0 + YY ** 2 / yc ** 2)
 
-    domain = ScalarDomain(
-        lengths, dims,
-        ne_type="import",
-        probing_direction='x',
-        auto_batching=False,
-        ne=ne,
-    )
-    return domain
+    return Domain.from_ne(ne, x, y, z, lengths, dims, lwl)
 
 
 def _make_ray(x0, y0, vx0):
@@ -148,10 +138,10 @@ def ncr(wavelength):
 
 
 @pytest.fixture
-def domain(ncr):
-    """ScalarDomain with quadratic trough profile for the current ncr."""
+def domain(ncr, wavelength):
+    """Domain with quadratic trough profile for the current ncr."""
     return _make_quadratic_trough_domain(
-        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC,
+        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC, wavelength,
     )
 
 # ---------------------------------------------------------------------------
@@ -182,7 +172,7 @@ def test_single_ray(lwl, tol_name):
     tol = TOLERANCE_PRESETS[tol_name]
 
     domain = _make_quadratic_trough_domain(
-        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC,
+        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC, lwl,
     )
 
     y0 = 0.01  # 1 cm offset
@@ -192,7 +182,7 @@ def test_single_ray(lwl, tol_name):
 
     s0 = _make_ray(-X_LENGTH / 2.0, y0, vx0)
 
-    prop = Propagator(domain, PROBING_DEPTH, lwl)
+    prop = Propagator(domain, PROBING_DEPTH)
     sol = prop(s0)
 
     final = np.asarray(sol.ys[0, -1, :])
@@ -233,7 +223,7 @@ def test_multiple_rays(lwl, tol_name):
     tol = TOLERANCE_PRESETS[tol_name]
 
     domain = _make_quadratic_trough_domain(
-        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC,
+        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC, lwl,
     )
 
     Np = len(Y0_VALUES)
@@ -245,7 +235,7 @@ def test_multiple_rays(lwl, tol_name):
         s0 = s0.at[1, j].set(y0)
         s0 = s0.at[3, j].set(c * n_y0)
 
-    prop = Propagator(domain, PROBING_DEPTH, lwl)
+    prop = Propagator(domain, PROBING_DEPTH)
     sol = prop(s0)
 
     for j, y0 in enumerate(Y0_VALUES):

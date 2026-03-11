@@ -33,19 +33,20 @@ from shared.propagation import back_propogate
 class Propagator(eqx.Module):
     """Equinox module wrapping the diffrax ray-trace solver.
 
-    Stores the electron-density field, grid coordinates, and all solver
+    Stores the refractive-index field, grid coordinates, and all solver
     parameters as JAX-compatible fields so the entire object can be
     passed through ``jax.jit`` / ``jax.vmap`` without issues.
 
     Usage::
 
-        prop = Propagator(domain, probing_depth=0.10, lwl=351e-9)
-        sol  = prop(s0)          # s0 shape: (6, Np)
+        domain = Domain.from_ne(ne, x, y, z, lengths, dims, lwl=351e-9)
+        prop   = Propagator(domain, probing_depth=0.10)
+        sol    = prop(s0)          # s0 shape: (6, Np)
         # sol.ys has shape (Np, save_points, 6)
     """
 
     # Domain fields
-    ne: jax.Array
+    n: jax.Array
     x: jax.Array
     y: jax.Array
     z: jax.Array
@@ -53,33 +54,29 @@ class Propagator(eqx.Module):
     dims: jax.Array
 
     # Physical / solver scalars
-    omega: float
     norm_factor: float
     rtol: float
     atol: float
     save_points: int
     max_steps: int
 
-    def __init__(self, domain, probing_depth, lwl, *,
+    def __init__(self, domain, probing_depth, *,
                  save_points=2, rtol=1e-3, atol=1e-5, max_steps=int(2e8)):
         """
         Args:
-            domain: A ScalarDomain (must expose .ne, .x, .y, .z, .lengths, .dims).
+            domain: A Domain (must expose .n, .x, .y, .z, .lengths, .dims).
             probing_depth (float): Physical depth to trace (metres).
-            lwl (float): Laser wavelength (metres).
             save_points (int): Number of time-slices to save (≥2).
             rtol (float): Relative tolerance for adaptive stepper.
             atol (float): Absolute tolerance for adaptive stepper.
             max_steps (int): Maximum number of integration steps.
         """
-        self.ne = domain.ne
+        self.n = domain.n
         self.x = domain.x
         self.y = domain.y
         self.z = domain.z
         self.lengths = domain.lengths
         self.dims = domain.dims
-
-        self.omega = 2.0 * jnp.pi * (sc.c / lwl)
 
         # sqrt(8) safety factor so rays have time to exit the box
         t_end = jnp.sqrt(8.0) * probing_depth / sc.c
@@ -103,13 +100,14 @@ class Propagator(eqx.Module):
         return jnp.sqrt(1.0 - (Propagator.omega_pe(ne * 1e-6) / omega) ** 2)
 
     @staticmethod
-    def dndr(r, gradient_term, omega, x, y, z):
+    def dndr(r, gradient_term, x, y, z):
         """Gradient of the refractive-index term at positions *r*.
 
         Args:
             r: (N, 3) position array.
-            gradient_term: 3-D array of -0.5 c²  ne / (mₑ ε₀ / e²) / ω².
-            omega: laser angular frequency.
+            gradient_term: 3-D array where each element is 0.5·c²·n²,
+                used for computing the spatial gradient that drives
+                ray deflection.
             x, y, z: 1-D coordinate arrays of the domain grid.
 
         Returns:
@@ -132,15 +130,14 @@ class Propagator(eqx.Module):
         return grad
 
     @staticmethod
-    def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
+    def dsdt(t, s, parallelise, n, x, y, z, lengths, dims):
         """ODE right-hand side for photon ray equations.
 
         Args:
             t: time (unused — the problem is time-invariant).
             s: flattened 6×N state vector (or 6-vector when parallelised).
             parallelise: if True, reshape to (6, 1) for the vmap path.
-            ne, x, y, z: electron density field and grid coordinates.
-            omega: laser angular frequency.
+            n, x, y, z: refractive-index field and grid coordinates.
             lengths, dims: domain size / resolution (unused inside, kept for
                            interface compatibility with the legacy solver).
 
@@ -158,9 +155,9 @@ class Propagator(eqx.Module):
         v = s[3:6, :]
         del s
 
-        gradient_term = -0.5 * (sc.c / omega) ** 2 * ne / (sc.m_e * sc.epsilon_0 / sc.e ** 2)
+        gradient_term = 0.5 * sc.c ** 2 * n ** 2
 
-        sprime = sprime.at[3:6, :].set(Propagator.dndr(r, gradient_term, omega, x, y, z))
+        sprime = sprime.at[3:6, :].set(Propagator.dndr(r, gradient_term, x, y, z))
         sprime = sprime.at[:3, :].set(v)
 
         return jnp.ravel(sprime)
@@ -182,9 +179,8 @@ class Propagator(eqx.Module):
 
         args = (
             True,           # parallelise (always True for vmap path)
-            self.ne,
+            self.n,
             self.x, self.y, self.z,
-            self.omega,
             self.lengths, self.dims,
         )
 
@@ -235,7 +231,7 @@ def omega_pe(ne):
 def n_refrac(ne, omega):
     return Propagator.n_refrac(ne, omega)
 
-def dndr(r, gradient_term, omega, x, y, z):
+def dndr(r, gradient_term, x, y, z):
     """
     Returns the gradient at the locations r
 
@@ -245,10 +241,10 @@ def dndr(r, gradient_term, omega, x, y, z):
     Returns:
         3 x N float: N [dx, dy, dz] electron density gradients
     """
-    return Propagator.dndr(r, gradient_term, omega, x, y, z)
+    return Propagator.dndr(r, gradient_term, x, y, z)
 
 # ODEs of photon paths, standalone function to support the solve()
-def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
+def dsdt(t, s, parallelise, n, x, y, z, lengths, dims):
     """
     Returns an array with the gradients and velocity per ray for ode_int
 
@@ -260,7 +256,7 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
     Returns:
         6N float array: flattened array for ode_int
     """
-    return Propagator.dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims)
+    return Propagator.dsdt(t, s, parallelise, n, x, y, z, lengths, dims)
    
 def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose):
     """
@@ -374,13 +370,13 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
     else:
         assert "\nWhat."
 
-def solve_minimal(s0, domain, probing_depth, lwl, *, save_points = 2, rtol = 1e-3, atol = 1e-5):
+def solve_minimal(s0, domain, probing_depth, *, save_points = 2, rtol = 1e-3, atol = 1e-5):
     """Convenience wrapper around :class:`Propagator`.
 
     Kept for backward compatibility — constructs a ``Propagator`` and
     calls it immediately.  New code should use ``Propagator`` directly.
     """
-    prop = Propagator(domain, probing_depth, lwl,
+    prop = Propagator(domain, probing_depth,
                       save_points=save_points, rtol=rtol, atol=atol)
     return prop(s0)
 
