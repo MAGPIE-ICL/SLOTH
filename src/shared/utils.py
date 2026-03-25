@@ -1,5 +1,4 @@
 import numpy as np
-import jax.numpy as jnp
 
 import matplotlib.pyplot as plt
 
@@ -24,7 +23,7 @@ def random_inv_pow_array(power, length, seed = None):
     return np.random.power(power, length)
 
 def count_nans(matrix, *, axes = [0, 2], ret = False):
-    matrix = jnp.asarray(matrix)
+    matrix = np.asarray(matrix)
 
     dim = len(axes)
     stats = np.zeros((dim, 2))
@@ -32,7 +31,7 @@ def count_nans(matrix, *, axes = [0, 2], ret = False):
     mask = True
     for i in range(dim):
         arr = matrix[i]
-        mask = mask & ~jnp.isnan(arr)
+        mask = mask & ~np.isnan(arr)
 
     for i in range(dim):
         stats[i, 0] = len(matrix[i])
@@ -45,9 +44,9 @@ def count_nans(matrix, *, axes = [0, 2], ret = False):
     if ret:
         matrix = matrix.at[:, :].set(matrix[:, mask])
 
-        # jnp.split turns the matrix into M rows of shape (1, N)
-        # jnp.squeeze forces each row to shape (N,)
-        return tuple(jnp.squeeze(r, axis=0) for r in jnp.split(matrix, matrix.shape[0], axis = 0))
+        # np.split turns the matrix into M rows of shape (1, N)
+        # np.squeeze forces each row to shape (N,)
+        return tuple(np.squeeze(r, axis=0) for r in np.split(matrix, matrix.shape[0], axis = 0))
     '''
 
     if ret:
@@ -100,7 +99,7 @@ def domain_estimate(x_n, y_n, z_n, *, enable_x64 = False):
         conv = 4
 
     return np.int64(x_n * y_n * z_n * conv)
-    # np.int64 not jnp.int64 as jnp arrays are limited to 32 bits by default
+    # np.int64 not np.int64 as np arrays are limited to 32 bits by default
     #return np.int64(dims[0] * dims[1] * dims[2] * conv)
 
 def add_integer_postfix(int):
@@ -125,13 +124,13 @@ def find_sig_n(x, n):
     ValueError: Non-hashable static arguments are not supported. An error occurred while trying to hash an object of type <class 'jaxlib.xla_extension.ArrayImpl'>, 5. The error was:
     TypeError: unhashable type: 'jaxlib.xla_extension.ArrayImpl'
 
-    using jnp.int32 instead of regular int conversion causes issues - why does jnp.round not support standard jax data types?
+    using np.int32 instead of regular int conversion causes issues - why does np.round not support standard jax data types?
     '''
 
-    return n - int(jnp.floor(jnp.log10(abs(x)))) - 1
+    return n - int(np.floor(np.log10(abs(x)))) - 1
 
 def round_to_n(x, n):
-    return jnp.round(x, find_sig_n(x, n))
+    return np.round(x, find_sig_n(x, n))
 
     ##
     ## package-wide code for interpolations
@@ -140,16 +139,16 @@ def round_to_n(x, n):
 def baseRayPlot(x, y, *, scaling = 1, bin_scale = 1, pix_x = 3448, pix_y = 2574, Lx = 18, Ly = 13.5):
     print("\nrf size expected: (", len(x), ", ", len(y), ")", sep='')
 
-    # means that jnp.isnan(a) returns True when a is not Nan
+    # means that np.isnan(a) returns True when a is not Nan
     # ensures that x & y are the same length, if output of either is Nan then will not try to render ray in histogram
-    mask = ~jnp.isnan(x) & ~jnp.isnan(y)
+    mask = ~np.isnan(x) & ~np.isnan(y)
 
     x = x[mask]
     y = y[mask]
 
     print("rf after clearing nan's: (", len(x), ", ", len(y), ")", sep='')
 
-    H, xedges, yedges = jnp.histogram2d(x, y, bins=[pix_x // bin_scale, pix_y // bin_scale], range=[[-Lx / 2, Lx / 2],[-Ly / 2, Ly / 2]])
+    H, xedges, yedges = np.histogram2d(x, y, bins=[pix_x // bin_scale, pix_y // bin_scale], range=[[-Lx / 2, Lx / 2],[-Ly / 2, Ly / 2]])
     H = H.T
 
     plt.imshow(H, cmap = 'hot', interpolation = 'nearest', clim = (0.5, 1))
@@ -170,9 +169,7 @@ def heat_plot(x, y, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, Lx = 18, Ly = 
     #axis.set_xlim([-9, 9])
     #axis.set_ylim([-6.75, 6.75])
 
-import numpy as np
 import jax
-import jax.numpy as jnp
 
 def memory_report(running_device=None, memory_limit=None):
     """
@@ -242,6 +239,6 @@ def memory_report(running_device=None, memory_limit=None):
 
 
 generic_valid_types = (
-    int, np.int32, np.int64, jnp.int32, jnp.int64,
-    float, np.float32, np.float64, jnp.float32, jnp.float64
+    int, np.int32, np.int64, np.int32, np.int64,
+    float, np.float32, np.float64, np.float32, np.float64
 )
