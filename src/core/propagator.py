@@ -225,7 +225,107 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
         assert "\nWhat."
 
 def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = True, save_points_per_region = 2, memory_debug = False, lwl = 1064e-9, keep_domain = False, return_raw_results = False, verbose = True):
-    
+    """
+    Trace rays through a scalar plasma domain and return their final state as a
+    Jones vector suitable for downstream diagnostics.
+
+    The beam can be supplied either as a pre-created ray matrix or as a compact
+    parameter tuple that is expanded into rays internally (necessary when domain
+    or ray batching is enabled).
+
+    Args:
+        beam (jax.Array or tuple): Either
+
+            * a ``(6, N)`` array of pre-created rays with rows
+              ``(x, y, z, vx, vy, vz)``; or
+            * a tuple ``(beam_size, divergence, ne_extent, probing_direction,
+              beam_type, seeded)`` whose elements are passed directly to
+              ``core.beam.Beam``.  This form is required when
+              ``ScalarDomain.ray_batch_count > 1``.
+
+        ScalarDomain (core.domain.ScalarDomain): Domain object produced by
+            ``core.domain.ScalarDomain``.  Its ``region_count`` and
+            ``ray_batch_count`` attributes control domain and ray batching
+            respectively.
+        probing_depth (float): Maximum propagation depth in metres along the
+            probing direction.
+        parallelise (bool): Use ``jax.vmap`` to parallelise over rays (default
+            ``True``).  Set to ``False`` to use the legacy serial solver
+            (single domain region only).
+        jitted (bool): JIT-compile the ODE solver with ``equinox.filter_jit``
+            (default ``True``).
+        save_points_per_region (int): Number of time-points saved per domain
+            region by the ODE solver (default ``2``, i.e. start and end).
+            Values greater than 2 return intermediate save points as a stacked
+            array.
+        memory_debug (bool): Print memory diagnostics and write a JAX device
+            memory profile to disk (default ``False``).
+        lwl (float): Laser wavelength in metres (default ``1064e-9``).  Used to
+            compute the angular frequency ``omega = 2π·c/lwl``.
+        keep_domain (bool): Reserved for future use (default ``False``).
+        return_raw_results (bool): Return the raw ``diffrax.Solution`` objects
+            instead of the processed Jones vector (default ``False``).
+        verbose (bool): Print progress and shape information (default ``True``).
+
+    Returns:
+        tuple: ``(rf, Jf, duration)``
+
+            * ``rf`` – Jones vector array of shape ``(4, N)`` (or a stacked
+              array of shape ``(n_saves, 4, N)`` when
+              ``save_points_per_region > 2``).  Rows are transverse position
+              and angle pairs; the exact mapping depends on
+              ``probing_direction`` (see ``shared.propagation.ray_to_Jonesvector``).
+            * ``Jf`` – ``None`` (reserved for future polarisation output).
+            * ``duration`` – wall-clock time of the ODE solve in seconds
+              (``numpy.float64``).
+
+            When ``return_raw_results=True`` the tuple is
+            ``(solutions, None, duration)`` where ``solutions`` is a
+            ``numpy`` array of ``diffrax.Solution`` objects.
+
+    Example::
+
+        import jax.numpy as jnp
+        import core.domain as d
+        import core.propagator as p
+
+        # --- domain ---
+        lwl              = 1064e-9          # laser wavelength (m)
+        probing_direction = 'z'
+        Np               = int(1e5)
+
+        domain = d.ScalarDomain(
+            lengths, dims,
+            leeway_factor     = 3,
+            ne_type           = "import",
+            probing_direction = probing_direction,
+            Np                = Np,
+            ne                = ne.v * 1e6,   # electron density in m⁻³
+        )
+
+        # --- beam ---
+        beam_size      = [extent_x, extent_y]  # half-widths (m)
+        probing_extent = extent_z
+        ne_extent      = probing_extent         # initialisation depth
+        divergence     = 0.1e-3                 # half-angle (rad)
+        beam_type      = "rectangular"
+
+        # --- solve ---
+        rf_jax, _, duration = p.solve(
+            (beam_size, divergence, ne_extent, probing_direction, beam_type, False),
+            domain,
+            probing_extent,
+            lwl     = lwl,
+            verbose = False,
+        )
+
+        # rf_jax has shape (4, Np): rows are x, φ_x, y, φ_y
+        # Pass to diagnostics, e.g.:
+        #   import processing.diagnostics as diag
+        #   shadowgrapher = diag.Shadowgraphy(rf_jax, focal_plane=-35)
+        #   shadowgrapher.single_lens_solve()
+    """
+
     omega = 2 * jnp.pi * (c / lwl)
 
     region_count = ScalarDomain.region_count
