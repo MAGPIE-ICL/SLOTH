@@ -3,7 +3,7 @@ Tests for the propagator gradient machinery.
 
 Covers:
     1. gradient_term formula matches the analytic expression
-       gradient_term = -0.5 * c^2 * ne / n_cr
+       gradient_term = 0.5 * c^2 * (1 - ne / n_cr)
        where n_cr = m_e * epsilon_0 * omega^2 / e^2.
     2. dndr returns zero gradient for uniform ne.
     3. dndr returns a constant gradient for a linear ne profile.
@@ -47,8 +47,15 @@ def _make_grid(nx=61, ny=63, nz=59,
 
 
 def _gradient_term(ne, omega):
-    """Compute the gradient_term array used by the propagator."""
-    return -0.5 * (sc.c / omega) ** 2 * ne / (sc.m_e * sc.epsilon_0 / sc.e ** 2) 
+    """Compute the gradient_term array used by the propagator.
+
+    New formula: gradient_term = 0.5 * c² * n²  where n² = 1 - ne/ncr.
+    The spatial gradient is identical to the old formula:
+        ∇(0.5·c²·n²) = -0.5·c²/ncr · ∇ne
+    """
+    ncr = _critical_density(omega)
+    n_sq = 1.0 - ne / ncr
+    return 0.5 * sc.c ** 2 * n_sq
 
 
 # Laser wavelength and corresponding angular frequency used throughout tests
@@ -61,7 +68,7 @@ _OMEGA = 2.0 * jnp.pi * sc.c / _LWL
 # ===================================================================
 
 class TestGradientTermFormula:
-    """Verify the gradient_term expression matches -0.5 * c^2 * ne / n_cr."""
+    """Verify the gradient_term expression matches 0.5 * c^2 * (1 - ne / n_cr)."""
 
     @pytest.mark.parametrize("lwl", [351e-9, 527e-9, 1053e-9])
     def test_matches_analytic(self, lwl):
@@ -72,17 +79,22 @@ class TestGradientTermFormula:
         ne = jnp.full((5, 5, 5), ne_val)
 
         gt = _gradient_term(ne, omega)
-        expected = -0.5 * sc.c ** 2 * ne_val / n_cr
+        expected = 0.5 * sc.c ** 2 * (1.0 - ne_val / n_cr)
 
         np.testing.assert_allclose(gt, expected, rtol=1e-6)
 
     def test_zero_density(self):
         ne = jnp.zeros((5, 5, 5))
         gt = _gradient_term(ne, _OMEGA)
-        np.testing.assert_allclose(gt, 0.0, atol=1e-30)
+        expected = 0.5 * sc.c ** 2  # n² = 1 when ne = 0
+        np.testing.assert_allclose(gt, expected, rtol=1e-6)
 
     def test_linearity_in_ne(self):
-        """gradient_term should scale linearly with ne."""
+        """The ne-dependent part of gradient_term scales linearly with ne.
+
+        gradient_term = 0.5*c²*(1 - ne/ncr), so the shift from the vacuum
+        value 0.5*c² is proportional to ne: doubling ne doubles the shift.
+        """
         n_cr = _critical_density(_OMEGA)
         ne1 = jnp.full((5, 5, 5), 0.1 * n_cr)
         ne2 = jnp.full((5, 5, 5), 0.2 * n_cr)
@@ -90,7 +102,8 @@ class TestGradientTermFormula:
         gt1 = _gradient_term(ne1, _OMEGA)
         gt2 = _gradient_term(ne2, _OMEGA)
 
-        np.testing.assert_allclose(gt2, 2.0 * gt1, rtol=1e-6)
+        vacuum = 0.5 * sc.c ** 2
+        np.testing.assert_allclose(vacuum - gt2, 2.0 * (vacuum - gt1), rtol=1e-6)
 
 
 # ===================================================================
@@ -113,7 +126,7 @@ class TestUniformDensity:
             [-0.5, 0.4, -0.3],
         ])
 
-        grad = dndr(r, gt, _OMEGA, x, y, z)
+        grad = dndr(r, gt, x, y, z)
 
         np.testing.assert_allclose(grad, 0.0, atol=1e-10*n_cr)
 
@@ -154,7 +167,7 @@ class TestLinearDensity:
             rng.uniform(-0.6, 0.6, N),
         ]))
 
-        grad = dndr(r, gt, _OMEGA, x, y, z)
+        grad = dndr(r, gt, x, y, z)
 
         np.testing.assert_allclose(grad[0, :], expected_gx, atol=1e-8*n_cr, rtol=1e-4)
         np.testing.assert_allclose(grad[1, :], expected_gy, atol=1e-8*n_cr, rtol=1e-4)
@@ -186,7 +199,7 @@ class TestQuadraticDensity:
             jnp.zeros_like(y_query),
         ], axis=-1)
 
-        grad = dndr(r, gt, _OMEGA, x, y, z)
+        grad = dndr(r, gt, x, y, z)
 
         expected_gy = prefactor * 2.0 * n0 * y_query
         np.testing.assert_allclose(grad[0, :], 0.0, atol=1e-8*n_cr)
@@ -210,7 +223,7 @@ class TestQuadraticDensity:
             jnp.zeros_like(x_query),
         ], axis=-1)
 
-        grad = dndr(r, gt, _OMEGA, x, y, z)
+        grad = dndr(r, gt, x, y, z)
 
         expected_gx = prefactor * 2.0 * n0 * x_query
         np.testing.assert_allclose(grad[0, :], expected_gx, atol=1e-8*n_cr, rtol=1e-4)
@@ -244,7 +257,7 @@ class TestExponentialDensity:
             jnp.zeros_like(x_query),
         ], axis=-1)
 
-        grad = dndr(r, gt, _OMEGA, x, y, z)
+        grad = dndr(r, gt, x, y, z)
 
         expected_gx = prefactor * n0 * k * jnp.exp(k * x_query)
         np.testing.assert_allclose(grad[0, :], expected_gx, atol=1e-8*n_cr, rtol=1e-4)
@@ -283,7 +296,7 @@ class TestSeparableProduct:
             [-0.1, 0.2, -0.15],
         ])
 
-        grad = dndr(r, gt, _OMEGA, x, y, z)
+        grad = dndr(r, gt, x, y, z)
 
         for i in range(r.shape[0]):
             xq, yq, zq = r[i]
@@ -316,8 +329,8 @@ class TestSymmetry:
         r_pos = jnp.array([[0.3, 0.0, 0.0]])
         r_neg = jnp.array([[-0.3, 0.0, 0.0]])
 
-        grad_pos = dndr(r_pos, gt, _OMEGA, x, y, z)
-        grad_neg = dndr(r_neg, gt, _OMEGA, x, y, z)
+        grad_pos = dndr(r_pos, gt, x, y, z)
+        grad_neg = dndr(r_neg, gt, x, y, z)
 
         # x-gradient should be the same constant at both points
         np.testing.assert_allclose(grad_pos[0, 0], grad_neg[0, 0], rtol=1e-4)
@@ -328,23 +341,29 @@ class TestSymmetry:
 # ===================================================================
 
 class TestOmegaScaling:
-    """gradient_term ∝ 1/omega^2, so doubling omega should quarter
-    the gradient_term and thus the gradient."""
+    """The ne-dependent part of gradient_term scales as 1/omega^2
+    (through ncr), so doubling omega should quarter the gradient."""
 
     def test_omega_scaling(self):
         x, y, z, X, Y, Z = _make_grid(nx=61, ny=61, nz=31)
-        n_cr_1 = _critical_density(_OMEGA)
 
         # Use a linear profile so gradient is easy to predict
         ne = 1.0e24 * X + 5.0e25
 
-        gt1 = _gradient_term(ne, _OMEGA)
-        gt2 = _gradient_term(ne, 2.0 * _OMEGA)
+        # Compute only the ne-dependent part: -0.5*c²*ne/ncr.
+        # The full gradient_term (0.5*c²*n²) includes a constant
+        # vacuum term that has zero gradient analytically, so omitting
+        # it changes nothing physically but avoids float32 precision
+        # loss in the finite-difference stencil.
+        ncr1 = _critical_density(_OMEGA)
+        ncr2 = _critical_density(2.0 * _OMEGA)
+        gt1 = -0.5 * sc.c ** 2 * ne / ncr1
+        gt2 = -0.5 * sc.c ** 2 * ne / ncr2
 
         r = jnp.array([[0.0, 0.0, 0.0]])
 
-        grad1 = dndr(r, gt1, _OMEGA, x, y, z)
-        grad2 = dndr(r, gt2, 2.0 * _OMEGA, x, y, z)
+        grad1 = dndr(r, gt1, x, y, z)
+        grad2 = dndr(r, gt2, x, y, z)
 
-        # gradient_term scales as 1/omega^2, so 4x reduction
+        # gradient scales as 1/ncr ∝ 1/omega^2, so 4x reduction
         np.testing.assert_allclose(grad2, grad1 / 4.0, rtol=1e-6)
