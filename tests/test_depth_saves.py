@@ -12,7 +12,10 @@ Physics checks:
      ValueError.
   4. Output structure: the returned dict has the expected keys and shapes.
   5. Pickle round-trip: data written to disk and reloaded matches the return value.
-  6. Uniform z-cadence: the z_saves array is uniformly spaced at the requested step.
+  6. Uniform depth-cadence: the depth_saves array is uniformly spaced at the
+     requested step.
+  7. jones_components selection: partial saves produce arrays with the correct
+     number of rows, and the values match the corresponding rows of a full save.
 """
 
 import os
@@ -120,11 +123,11 @@ class TestOutputStructure:
             omega=omega, jitted=True, verbose=False,
         )
 
-        assert 'z_saves' in result
-        assert 'x' in result
-        assert 'phi' in result
+        assert 'depth_saves' in result
+        assert 'jvec' in result
+        assert 'jones_components' in result
 
-    def test_z_saves_shape(self):
+    def test_depth_saves_shape(self):
         domain = _vacuum_domain()
         omega = 2 * np.pi * c / 1064e-9
         s0 = _collimated_rays(Np=8, z_start=-2e-3)
@@ -136,11 +139,10 @@ class TestOutputStructure:
             omega=omega, verbose=False,
         )
         # 0, 200, 400, 600, 800, 1000 µm → 6 save points
-        assert len(result['z_saves']) == 6
-        assert len(result['x']) == 6
-        assert len(result['phi']) == 6
+        assert len(result['depth_saves']) == 6
+        assert len(result['jvec']) == 6
 
-    def test_x_phi_shapes(self):
+    def test_jvec_shapes_all_components(self):
         Np = 10
         domain = _vacuum_domain()
         omega = 2 * np.pi * c / 1064e-9
@@ -153,14 +155,26 @@ class TestOutputStructure:
             omega=omega, verbose=False,
         )
 
-        for arr in result['x']:
-            assert arr.shape == (2, Np), f"x shape mismatch: {arr.shape}"
-        for arr in result['phi']:
-            assert arr.shape == (2, Np), f"phi shape mismatch: {arr.shape}"
+        # Default: all 4 Jones components → (4, Np) at each depth
+        for arr in result['jvec']:
+            assert arr.shape == (4, Np), f"jvec shape mismatch: {arr.shape}"
+
+    def test_jones_components_recorded(self):
+        domain = _vacuum_domain()
+        omega = 2 * np.pi * c / 1064e-9
+        s0 = _collimated_rays(Np=4, z_start=-2e-3)
+
+        result = trace_and_save_depths(
+            s0, domain,
+            z_step=500e-6, z_max=1e-3,
+            output_path=None,
+            omega=omega, verbose=False,
+        )
+        assert result['jones_components'] == [0, 1, 2, 3]
 
 
 class TestUniformSampling:
-    """Check that z_saves is uniformly spaced at the requested step."""
+    """Check that depth_saves is uniformly spaced at the requested step."""
 
     def test_spacing(self):
         domain = _vacuum_domain()
@@ -175,9 +189,9 @@ class TestUniformSampling:
             omega=omega, verbose=False,
         )
 
-        diffs = np.diff(result['z_saves'])
+        diffs = np.diff(result['depth_saves'])
         np.testing.assert_allclose(diffs, z_step, rtol=1e-6,
-                                   err_msg="z_saves not uniformly spaced")
+                                   err_msg="depth_saves not uniformly spaced")
 
     def test_starts_at_zero(self):
         domain = _vacuum_domain()
@@ -191,7 +205,7 @@ class TestUniformSampling:
             omega=omega, verbose=False,
         )
 
-        assert result['z_saves'][0] == pytest.approx(0.0)
+        assert result['depth_saves'][0] == pytest.approx(0.0)
 
     def test_ends_at_z_max(self):
         domain = _vacuum_domain()
@@ -206,7 +220,7 @@ class TestUniformSampling:
             omega=omega, verbose=False,
         )
 
-        assert result['z_saves'][-1] == pytest.approx(z_max)
+        assert result['depth_saves'][-1] == pytest.approx(z_max)
 
 
 class TestDomainValidation:
@@ -276,10 +290,9 @@ class TestPickle:
             with open(path, 'rb') as fh:
                 loaded = pickle.load(fh)
 
-            np.testing.assert_array_equal(loaded['z_saves'], result['z_saves'])
-            for j in range(len(result['x'])):
-                np.testing.assert_array_equal(loaded['x'][j], result['x'][j])
-                np.testing.assert_array_equal(loaded['phi'][j], result['phi'][j])
+            np.testing.assert_array_equal(loaded['depth_saves'], result['depth_saves'])
+            for j in range(len(result['jvec'])):
+                np.testing.assert_array_equal(loaded['jvec'][j], result['jvec'][j])
         finally:
             os.remove(path)
 
@@ -320,9 +333,10 @@ class TestVacuumPhysics:
             omega=omega, verbose=False,
         )
 
-        # Transverse positions at first and last save points should match
-        x_initial = result['x'][0]   # (2, Np)
-        x_final   = result['x'][-1]  # (2, Np)
+        # Transverse positions at first and last save points should match.
+        # All 4 components are saved by default; extract rows 0 and 2 (positions).
+        x_initial = result['jvec'][0][[0, 2], :]   # (2, Np)
+        x_final   = result['jvec'][-1][[0, 2], :]  # (2, Np)
 
         # Tolerance: rays move ~1.5 mm at c; numerical error should be < 1 µm
         np.testing.assert_allclose(
@@ -343,8 +357,9 @@ class TestVacuumPhysics:
             omega=omega, verbose=False,
         )
 
-        phi_initial = result['phi'][0]
-        phi_final   = result['phi'][-1]
+        # All 4 components are saved by default; extract rows 1 and 3 (angles).
+        phi_initial = result['jvec'][0][[1, 3], :]
+        phi_final   = result['jvec'][-1][[1, 3], :]
 
         np.testing.assert_allclose(
             phi_final, phi_initial, atol=1e-9,
@@ -389,10 +404,98 @@ class TestSlabPhysics:
         )
 
         # Mean x-position should decrease as rays deflect towards -x
-        mean_x_initial = float(np.mean(result['x'][0][0]))
-        mean_x_final   = float(np.mean(result['x'][-1][0]))
+        # jvec row 0 = pos_axis1 = x (for probing_direction='z')
+        mean_x_initial = float(np.mean(result['jvec'][0][0]))
+        mean_x_final   = float(np.mean(result['jvec'][-1][0]))
 
         assert mean_x_final < mean_x_initial, (
             f"Slab plasma: expected rays to deflect toward -x (away from high density), "
             f"but mean x went from {mean_x_initial:.4e} to {mean_x_final:.4e}."
         )
+
+
+class TestJonesComponents:
+    """
+    Verify the jones_components parameter.
+
+    The Jones vector rows are:
+        0 – transverse position,  first  transverse axis
+        1 – angle,                first  transverse axis
+        2 – transverse position,  second transverse axis
+        3 – angle,                second transverse axis
+    """
+
+    # Helper: run a small vacuum trace with the given jones_components value.
+    @staticmethod
+    def _run(jones_components):
+        domain = _vacuum_domain()
+        omega = 2 * np.pi * c / 1064e-9
+        s0 = _collimated_rays(Np=6, z_start=-2e-3)
+        return trace_and_save_depths(
+            s0, domain,
+            z_step=500e-6, z_max=1e-3,
+            output_path=None,
+            omega=omega, jones_components=jones_components, verbose=False,
+        )
+
+    def test_default_saves_all_four_rows(self):
+        result = self._run(None)
+        assert result['jones_components'] == [0, 1, 2, 3]
+        for arr in result['jvec']:
+            assert arr.shape[0] == 4
+
+    def test_all_keyword_saves_four_rows(self):
+        result = self._run('all')
+        assert result['jones_components'] == [0, 1, 2, 3]
+        for arr in result['jvec']:
+            assert arr.shape[0] == 4
+
+    def test_position_saves_two_rows(self):
+        result = self._run('position')
+        assert result['jones_components'] == [0, 2]
+        for arr in result['jvec']:
+            assert arr.shape[0] == 2
+
+    def test_angle_saves_two_rows(self):
+        result = self._run('angle')
+        assert result['jones_components'] == [1, 3]
+        for arr in result['jvec']:
+            assert arr.shape[0] == 2
+
+    def test_custom_list_saves_correct_rows(self):
+        result = self._run([0, 1])
+        assert result['jones_components'] == [0, 1]
+        for arr in result['jvec']:
+            assert arr.shape[0] == 2
+
+    def test_single_component_list(self):
+        result = self._run([2])
+        assert result['jones_components'] == [2]
+        for arr in result['jvec']:
+            assert arr.shape[0] == 1
+
+    def test_partial_matches_full_save(self):
+        """Values for 'position' must equal rows 0 and 2 of the full save."""
+        full = self._run(None)
+        pos  = self._run('position')
+        for j in range(len(full['jvec'])):
+            np.testing.assert_array_equal(
+                pos['jvec'][j],
+                full['jvec'][j][[0, 2], :],
+                err_msg=f"position save at depth index {j} does not match rows 0,2 of full save",
+            )
+
+    def test_angle_matches_full_save(self):
+        """Values for 'angle' must equal rows 1 and 3 of the full save."""
+        full  = self._run(None)
+        angle = self._run('angle')
+        for j in range(len(full['jvec'])):
+            np.testing.assert_array_equal(
+                angle['jvec'][j],
+                full['jvec'][j][[1, 3], :],
+                err_msg=f"angle save at depth index {j} does not match rows 1,3 of full save",
+            )
+
+    def test_invalid_index_raises(self):
+        with pytest.raises(ValueError, match="out of range"):
+            self._run([0, 5])

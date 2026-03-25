@@ -666,15 +666,32 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")
 
 
-def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *, omega, jitted=True, rtol=1e-3, atol=1e-5, verbose=True):
+def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *,
+                          omega, jones_components=None, jitted=True,
+                          rtol=1e-3, atol=1e-5, verbose=True):
     """
-    Trace rays through the domain and save the transverse position (x) and angle (phi) vectors
-    at uniformly-spaced depths along the propagation direction, then pickle the results.
+    Trace rays through the domain and save the Jones vector at uniformly-spaced
+    depths along the propagation direction, then pickle the results.
 
-    For each requested depth z0 the function records a snapshot of all N rays: their
-    transverse positions (x, y) and angles (phi, psi) projected onto the plane perpendicular
-    to the probing axis.  All snapshots together with the corresponding z0 values are
-    collected into a dictionary and written to a pickle file.
+    Works for any probing direction ('x', 'y', or 'z'); the direction is read
+    from ``ScalarDomain.probing_direction``.
+
+    The Jones vector at each depth is a 4-row array::
+
+        row 0 – transverse position along the first  transverse axis
+        row 1 – angle        along the first  transverse axis
+        row 2 – transverse position along the second transverse axis
+        row 3 – angle        along the second transverse axis
+
+    The mapping between rows and physical axes depends on the probing direction:
+
+    ==================  =======  =======  =======  =======
+    probing_direction   row 0    row 1    row 2    row 3
+    ==================  =======  =======  =======  =======
+    'z'                 x        φ_x      y        φ_y
+    'y'                 x        φ_x      z        φ_z
+    'x'                 y        φ_y      z        φ_z
+    ==================  =======  =======  =======  =======
 
     Args:
         s0 (jax.Array): Initial ray state, shape (6, N). Rows are (x, y, z, vx, vy, vz).
@@ -686,6 +703,14 @@ def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *, omega
         output_path (str or None): File path for the output pickle. Pass None to skip
             writing the file (results are still returned).
         omega (float): Angular frequency of the probing beam, rad/s.
+        jones_components: Selects which rows of the Jones vector to save.
+            Accepted values:
+
+            * ``None`` or ``'all'``  – save all four rows (default).
+            * ``'position'``         – save rows 0 and 2 (transverse positions only).
+            * ``'angle'``            – save rows 1 and 3 (angles only).
+            * list / tuple of ints  – save the specified row indices, e.g. ``[0, 1]``.
+
         jitted (bool): Whether to JIT-compile the ODE solver (default True).
         rtol (float): Relative ODE tolerance (default 1e-3).
         atol (float): Absolute ODE tolerance (default 1e-5).
@@ -693,21 +718,38 @@ def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *, omega
 
     Returns:
         dict: Keys:
-            ``z_saves``  – 1-D numpy array of depth save positions (metres).
-            ``x``        – list of (2, N) numpy arrays; transverse positions at each depth.
-                           Row 0 is the first transverse axis, row 1 is the second.
-            ``phi``      – list of (2, N) numpy arrays; angles at each depth.
-                           Row 0 is the angle in the first transverse axis, row 1 in the second.
+            ``depth_saves``       – 1-D numpy array of depth positions along the
+                                    probing axis (metres).
+            ``jvec``              – list of ``(n_components, N)`` numpy arrays; the
+                                    selected Jones-vector rows at each depth.
+            ``jones_components``  – list of int indices recording which rows were saved.
 
     Raises:
         ValueError: If the domain length in the probing direction is smaller than z_max.
         ValueError: If z_step is not positive or z_max <= 0.
+        ValueError: If jones_components contains an index outside [0, 3].
     """
 
     import pickle
 
     if z_step <= 0 or z_max <= 0:
         raise ValueError("z_step and z_max must be positive.")
+
+    # ── Parse jones_components ────────────────────────────────────────────────
+    if jones_components is None or jones_components == 'all':
+        comp_indices = [0, 1, 2, 3]
+    elif jones_components == 'position':
+        comp_indices = [0, 2]
+    elif jones_components == 'angle':
+        comp_indices = [1, 3]
+    else:
+        comp_indices = list(jones_components)
+        invalid = [i for i in comp_indices if i not in (0, 1, 2, 3)]
+        if invalid:
+            raise ValueError(
+                f"jones_components indices {invalid} are out of range. "
+                f"Valid indices are 0, 1, 2, 3."
+            )
 
     probing_direction = ScalarDomain.probing_direction
     dir_idx = ['x', 'y', 'z'].index(probing_direction)
@@ -722,18 +764,19 @@ def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *, omega
 
     # Uniform depth save positions: [0, z_step, 2*z_step, ..., z_max]
     n_saves = int(np.round(z_max / z_step)) + 1
-    z_saves = np.linspace(0.0, z_max, n_saves)
+    depth_saves = np.linspace(0.0, z_max, n_saves)
 
     if verbose:
         print(f"\ntrace_and_save_depths: saving at {n_saves} depth(s) from 0 to {z_max*1e3:.4g} mm "
-              f"(step = {z_step*1e6:.4g} µm).")
+              f"(step = {z_step*1e6:.4g} µm, probing direction = '{probing_direction}', "
+              f"jones_components = {comp_indices}).")
 
     # Map depth positions to normalised diffrax time [0, 1].
     # The ODE solver normalises real time by norm_factor = sqrt(8)*trace_depth/c so
     # that t_norm=1 corresponds to the end of the trace.  A ray travelling at ~c
-    # covers depth z0 in real time z0/c, giving normalised time z0/(sqrt(8)*trace_depth).
+    # covers depth d in real time d/c, giving normalised time d/(sqrt(8)*trace_depth).
     norm_factor = np.sqrt(8.0) * trace_depth / c
-    t_saves_norm = z_saves / (np.sqrt(8.0) * trace_depth)
+    t_saves_norm = depth_saves / (np.sqrt(8.0) * trace_depth)
 
     Np = s0.shape[1]
 
@@ -779,24 +822,24 @@ def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *, omega
         jax.vmap(_ode_solve, in_axes=(0, None))(s0_T, args)
     )
 
-    # sol.ys has shape (N, n_saves, 6).  Extract x and phi at each save point.
-    x_list = []
-    phi_list = []
+    # sol.ys has shape (N, n_saves, 6).
+    # For each depth snapshot: compute the full 4-row Jones vector via
+    # ray_to_Jonesvector (keep_current_plane=True records the actual position
+    # and angle at that depth, not propagated to the exit plane), then keep
+    # only the user-requested rows.
+    jvec_list = []
 
     for j in range(n_saves):
         rays_j = sol.ys[:, j, :].T  # shape (6, N)
-        jvec, _ = ray_to_Jonesvector(rays_j, keep_current_plane=True,
-                                      probing_direction=probing_direction)
-        jvec = np.asarray(jvec)
-
-        # jvec rows: [pos_axis1, angle_axis1, pos_axis2, angle_axis2]
-        x_list.append(jvec[[0, 2], :])    # (2, N) transverse positions
-        phi_list.append(jvec[[1, 3], :])  # (2, N) angles
+        jvec_full, _ = ray_to_Jonesvector(rays_j, keep_current_plane=True,
+                                           probing_direction=probing_direction)
+        # jvec_full rows: [pos_axis1, angle_axis1, pos_axis2, angle_axis2]
+        jvec_list.append(np.asarray(jvec_full)[comp_indices, :])  # (n_comp, N)
 
     result = {
-        'z_saves': z_saves,
-        'x': x_list,
-        'phi': phi_list,
+        'depth_saves': depth_saves,
+        'jvec': jvec_list,
+        'jones_components': comp_indices,
     }
 
     if output_path is not None:
