@@ -664,3 +664,188 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
     else:
         print("\nData output as a hdf4.tar.gz file due to limitations of vram/ram space.")
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")
+
+
+def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
+                          omega, jones_components=None, jitted=True,
+                          rtol=1e-3, atol=1e-5, verbose=True):
+    """
+    Trace rays through the domain and save the Jones vector at uniformly-spaced
+    depths along the propagation direction, then pickle the results.
+
+    Works for any probing direction ('x', 'y', or 'z'); the direction is read
+    from ``ScalarDomain.probing_direction``.
+
+    The Jones vector at each depth is a 4-row array::
+
+        row 0 – transverse position along the first  transverse axis
+        row 1 – angle        along the first  transverse axis
+        row 2 – transverse position along the second transverse axis
+        row 3 – angle        along the second transverse axis
+
+    The mapping between rows and physical axes depends on the probing direction:
+
+    ==================  =======  =======  =======  =======
+    probing_direction   row 0    row 1    row 2    row 3
+    ==================  =======  =======  =======  =======
+    'z'                 x        φ_x      y        φ_y
+    'y'                 x        φ_x      z        φ_z
+    'x'                 y        φ_y      z        φ_z
+    ==================  =======  =======  =======  =======
+
+    Args:
+        s0 (jax.Array): Initial ray state, shape (6, N). Rows are (x, y, z, vx, vy, vz).
+        ScalarDomain (core.domain.ScalarDomain): Domain object. Its extent in the probing
+            direction must be >= depth_max.
+        step (float): Cadence of depth saves, in metres (e.g. 200e-6 for 200 µm).
+        depth_max (float): Maximum propagation depth to record, in metres (e.g. 1e-3 for 1 mm).
+            The domain length in the probing direction must be >= depth_max.
+        output_path (str or None): File path for the output pickle. Pass None to skip
+            writing the file (results are still returned).
+        omega (float): Angular frequency of the probing beam, rad/s.
+        jones_components: Selects which rows of the Jones vector to save.
+            Accepted values:
+
+            * ``None`` or ``'all'``  – save all four rows (default).
+            * ``'position'``         – save rows 0 and 2 (transverse positions only).
+            * ``'angle'``            – save rows 1 and 3 (angles only).
+            * list / tuple of ints  – save the specified row indices, e.g. ``[0, 1]``.
+
+        jitted (bool): Whether to JIT-compile the ODE solver (default True).
+        rtol (float): Relative ODE tolerance (default 1e-3).
+        atol (float): Absolute ODE tolerance (default 1e-5).
+        verbose (bool): Print progress information (default True).
+
+    Returns:
+        dict: Keys:
+            ``depth_saves``       – 1-D numpy array of depth positions along the
+                                    probing axis (metres).
+            ``jvec``              – list of ``(n_components, N)`` numpy arrays; the
+                                    selected Jones-vector rows at each depth.
+            ``jones_components``  – list of int indices recording which rows were saved.
+
+    Raises:
+        ValueError: If the domain length in the probing direction is smaller than depth_max.
+        ValueError: If step is not positive or depth_max <= 0.
+        ValueError: If jones_components contains an index outside [0, 3].
+    """
+
+    import pickle
+
+    if step <= 0 or depth_max <= 0:
+        raise ValueError("step and depth_max must be positive.")
+
+    # ── Parse jones_components ────────────────────────────────────────────────
+    if jones_components is None or jones_components == 'all':
+        comp_indices = [0, 1, 2, 3]
+    elif jones_components == 'position':
+        comp_indices = [0, 2]
+    elif jones_components == 'angle':
+        comp_indices = [1, 3]
+    else:
+        comp_indices = list(jones_components)
+        invalid = [i for i in comp_indices if i not in (0, 1, 2, 3)]
+        if invalid:
+            raise ValueError(
+                f"jones_components indices {invalid} are out of range. "
+                f"Valid indices are 0, 1, 2, 3."
+            )
+
+    probing_direction = ScalarDomain.probing_direction
+    dir_idx = ['x', 'y', 'z'].index(probing_direction)
+    trace_depth = float(ScalarDomain.lengths[dir_idx])
+
+    if trace_depth < depth_max:
+        raise ValueError(
+            f"Domain length in probing direction '{probing_direction}' ({trace_depth:.6g} m) "
+            f"is smaller than the requested depth_max ({depth_max:.6g} m). "
+            f"Increase the domain size to at least depth_max."
+        )
+
+    # Uniform depth save positions: [0, step, 2*step, ..., depth_max]
+    n_saves = int(np.round(depth_max / step)) + 1
+    depth_saves = np.linspace(0.0, depth_max, n_saves)
+
+    if verbose:
+        print(f"\ntrace_and_save_depths: saving at {n_saves} depth(s) from 0 to {depth_max*1e3:.4g} mm "
+              f"(step = {step*1e6:.4g} µm, probing direction = '{probing_direction}', "
+              f"jones_components = {comp_indices}).")
+
+    # Map depth positions to normalised diffrax time [0, 1].
+    # The ODE solver normalises real time by norm_factor = sqrt(8)*trace_depth/c so
+    # that t_norm=1 corresponds to the end of the trace.  A ray travelling at ~c
+    # covers depth d in real time d/c, giving normalised time d/(sqrt(8)*trace_depth).
+    norm_factor = np.sqrt(8.0) * trace_depth / c
+    t_saves_norm = depth_saves / (np.sqrt(8.0) * trace_depth)
+
+    Np = s0.shape[1]
+
+    args = (
+        True,  # parallelise=True (each vmap'd call handles one ray)
+        ScalarDomain.ne,
+        ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
+        omega,
+        ScalarDomain.lengths, ScalarDomain.dims,
+    )
+
+    def dsdt_ODE(t, y, args):
+        return dsdt(t, y, *args) * norm_factor
+
+    from diffrax import ODETerm, Tsit5, SaveAt, PIDController, diffeqsolve
+
+    term = ODETerm(dsdt_ODE)
+    solver = Tsit5()
+    saveat = SaveAt(ts=jnp.array(t_saves_norm))
+    stepsize_controller = PIDController(rtol=rtol, atol=atol)
+
+    def _ode_solve(s0_ray, args):
+        return diffeqsolve(
+            term,
+            solver,
+            y0=jnp.array(s0_ray),
+            args=args,
+            t0=float(t_saves_norm[0]),
+            t1=float(t_saves_norm[-1]),
+            dt0=None,
+            saveat=saveat,
+            stepsize_controller=stepsize_controller,
+            max_steps=int(2e8),
+        )
+
+    if jitted:
+        from equinox import filter_jit
+        _ode_solve = filter_jit(_ode_solve)
+
+    # vmap over rays; each call handles one ray (shape (6,))
+    s0_T = s0.T  # shape (N, 6)
+    sol = jax.block_until_ready(
+        jax.vmap(_ode_solve, in_axes=(0, None))(s0_T, args)
+    )
+
+    # sol.ys has shape (N, n_saves, 6).
+    # For each depth snapshot: compute the full 4-row Jones vector via
+    # ray_to_Jonesvector (keep_current_plane=True records the actual position
+    # and angle at that depth, not propagated to the exit plane), then keep
+    # only the user-requested rows.
+    jvec_list = []
+
+    for j in range(n_saves):
+        rays_j = sol.ys[:, j, :].T  # shape (6, N)
+        jvec_full, _ = ray_to_Jonesvector(rays_j, keep_current_plane=True,
+                                           probing_direction=probing_direction)
+        # jvec_full rows: [pos_axis1, angle_axis1, pos_axis2, angle_axis2]
+        jvec_list.append(np.asarray(jvec_full)[comp_indices, :])  # (n_comp, N)
+
+    result = {
+        'depth_saves': depth_saves,
+        'jvec': jvec_list,
+        'jones_components': comp_indices,
+    }
+
+    if output_path is not None:
+        with open(output_path, 'wb') as fh:
+            pickle.dump(result, fh)
+        if verbose:
+            print(f"trace_and_save_depths: results saved to '{output_path}'.")
+
+    return result
