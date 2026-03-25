@@ -766,7 +766,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")
 
 
-def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
+def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
                           lwl=1064e-9, jones_components=None, jitted=True,
                           rtol=1e-3, atol=1e-5, verbose=True):
     """
@@ -794,9 +794,18 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
     ==================  =======  =======  =======  =======
 
     Args:
-        s0 (jax.Array): Initial ray state, shape (6, N). Rows are (x, y, z, vx, vy, vz).
+        beam (jax.Array or tuple): Either
+
+            * a ``(6, N)`` array of pre-created rays with rows
+              ``(x, y, z, vx, vy, vz)``; or
+            * a tuple ``(beam_size, divergence, ne_extent, probing_direction,
+              beam_type, seeded)`` whose elements are passed directly to
+              ``core.beam.Beam``.  When a tuple is supplied the number of rays
+              is taken from ``ScalarDomain.Np_total``, which must be set.
+
         ScalarDomain (core.domain.ScalarDomain): Domain object. Its extent in the probing
-            direction must be >= depth_max.
+            direction must be >= depth_max.  When *beam* is a tuple,
+            ``ScalarDomain.Np_total`` must be set to the desired number of rays.
         step (float): Cadence of depth saves, in metres (e.g. 200e-6 for 200 µm).
         depth_max (float): Maximum propagation depth to record, in metres (e.g. 1e-3 for 1 mm).
             The domain length in the probing direction must be >= depth_max.
@@ -830,20 +839,17 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
         ValueError: If step is not positive or depth_max <= 0.
         ValueError: If jones_components contains an index outside [0, 3].
 
-    Example::
+    Example (tuple beam)::
 
-        import numpy as np
-        import jax.numpy as jnp
         import core.domain as d
         import core.propagator as p
-        from scipy.constants import c
 
         # --- parameters ---
         lwl               = 1064e-9          # laser wavelength (m)
         probing_direction = 'z'
         Np                = int(1e5)
 
-        # --- domain ---
+        # --- domain (Np stored here, not in the beam tuple) ---
         domain = d.ScalarDomain(
             lengths, dims,
             leeway_factor     = 3,
@@ -853,23 +859,10 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
             ne                = ne.v * 1e6,  # electron density in m⁻³
         )
 
-        # --- initial rays (6 × N: x, y, z, vx, vy, vz) ---
-        beam_radius = 500e-6                            # 500 µm beam half-width
-        rng         = np.random.default_rng(0)
-        r           = beam_radius * np.sqrt(rng.random(Np))
-        theta       = 2 * np.pi * rng.random(Np)
-        s0 = jnp.array(np.stack([
-            r * np.cos(theta),                          # x
-            r * np.sin(theta),                          # y
-            np.full(Np, -probing_extent / 2),           # z (entry face)
-            np.zeros(Np),                               # vx
-            np.zeros(Np),                               # vy
-            np.full(Np, c),                             # vz  (propagating in +z)
-        ], axis=0), dtype=jnp.float32)
-
         # --- trace and save Jones vector every 200 µm up to 1 mm ---
         result = p.trace_and_save_depths(
-            s0, domain,
+            (500e-6, 0.1e-3, probing_extent, probing_direction, "circular", False),
+            domain,
             step       = 200e-6,            # save cadence (m)
             depth_max  = 1e-3,              # maximum depth (m)
             output_path= "depth_saves.pkl", # set to None to skip file write
@@ -892,6 +885,29 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
     import pickle
 
     omega = 2 * np.pi * (c / lwl)
+
+    # ── Resolve beam: accept either a pre-built (6, N) ray array or a compact
+    # parameter tuple (beam_size, divergence, ne_extent, probing_direction,
+    # beam_type, seeded).  When a tuple is supplied the number of rays is read
+    # from ScalarDomain.Np_total so that Np does not need to appear in the
+    # tuple, consistent with how solve() works.
+    if isinstance(beam, tuple):
+        from core.beam import Beam
+        assert getattr(ScalarDomain, 'Np_total', None) is not None, (
+            "\nScalarDomain.Np_total must be set when passing beam as a tuple. "
+            "Pass Np=<number_of_rays> to ScalarDomain(...)."
+        )
+        s0 = Beam(
+            ScalarDomain.Np_total,
+            beam_size         = beam[0],
+            divergence        = beam[1],
+            ne_extent         = beam[2],
+            probing_direction = beam[3],
+            beam_type         = beam[4],
+            seeded            = beam[5],
+        ).s0
+    else:
+        s0 = beam
 
     if step <= 0 or depth_max <= 0:
         raise ValueError("step and depth_max must be positive.")
