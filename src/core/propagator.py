@@ -667,7 +667,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
 
 def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
-                          omega, jones_components=None, jitted=True,
+                          lwl=1064e-9, jones_components=None, jitted=True,
                           rtol=1e-3, atol=1e-5, verbose=True):
     """
     Trace rays through the domain and save the Jones vector at uniformly-spaced
@@ -702,7 +702,8 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
             The domain length in the probing direction must be >= depth_max.
         output_path (str or None): File path for the output pickle. Pass None to skip
             writing the file (results are still returned).
-        omega (float): Angular frequency of the probing beam, rad/s.
+        lwl (float): Laser wavelength in metres (default 1064e-9). Used to compute
+            the angular frequency ``omega = 2π·c/lwl``.
         jones_components: Selects which rows of the Jones vector to save.
             Accepted values:
 
@@ -731,6 +732,8 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
     """
 
     import pickle
+
+    omega = 2 * np.pi * (c / lwl)
 
     if step <= 0 or depth_max <= 0:
         raise ValueError("step and depth_max must be positive.")
