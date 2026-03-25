@@ -666,7 +666,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")
 
 
-def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *,
+def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
                           omega, jones_components=None, jitted=True,
                           rtol=1e-3, atol=1e-5, verbose=True):
     """
@@ -696,10 +696,10 @@ def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *,
     Args:
         s0 (jax.Array): Initial ray state, shape (6, N). Rows are (x, y, z, vx, vy, vz).
         ScalarDomain (core.domain.ScalarDomain): Domain object. Its extent in the probing
-            direction must be >= z_max.
-        z_step (float): Cadence of depth saves, in metres (e.g. 200e-6 for 200 µm).
-        z_max (float): Maximum propagation depth to record, in metres (e.g. 1e-3 for 1 mm).
-            The domain length in the probing direction must be >= z_max.
+            direction must be >= depth_max.
+        step (float): Cadence of depth saves, in metres (e.g. 200e-6 for 200 µm).
+        depth_max (float): Maximum propagation depth to record, in metres (e.g. 1e-3 for 1 mm).
+            The domain length in the probing direction must be >= depth_max.
         output_path (str or None): File path for the output pickle. Pass None to skip
             writing the file (results are still returned).
         omega (float): Angular frequency of the probing beam, rad/s.
@@ -725,15 +725,15 @@ def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *,
             ``jones_components``  – list of int indices recording which rows were saved.
 
     Raises:
-        ValueError: If the domain length in the probing direction is smaller than z_max.
-        ValueError: If z_step is not positive or z_max <= 0.
+        ValueError: If the domain length in the probing direction is smaller than depth_max.
+        ValueError: If step is not positive or depth_max <= 0.
         ValueError: If jones_components contains an index outside [0, 3].
     """
 
     import pickle
 
-    if z_step <= 0 or z_max <= 0:
-        raise ValueError("z_step and z_max must be positive.")
+    if step <= 0 or depth_max <= 0:
+        raise ValueError("step and depth_max must be positive.")
 
     # ── Parse jones_components ────────────────────────────────────────────────
     if jones_components is None or jones_components == 'all':
@@ -755,20 +755,20 @@ def trace_and_save_depths(s0, ScalarDomain, z_step, z_max, output_path, *,
     dir_idx = ['x', 'y', 'z'].index(probing_direction)
     trace_depth = float(ScalarDomain.lengths[dir_idx])
 
-    if trace_depth < z_max:
+    if trace_depth < depth_max:
         raise ValueError(
             f"Domain length in probing direction '{probing_direction}' ({trace_depth:.6g} m) "
-            f"is smaller than the requested z_max ({z_max:.6g} m). "
-            f"Increase the domain size to at least z_max."
+            f"is smaller than the requested depth_max ({depth_max:.6g} m). "
+            f"Increase the domain size to at least depth_max."
         )
 
-    # Uniform depth save positions: [0, z_step, 2*z_step, ..., z_max]
-    n_saves = int(np.round(z_max / z_step)) + 1
-    depth_saves = np.linspace(0.0, z_max, n_saves)
+    # Uniform depth save positions: [0, step, 2*step, ..., depth_max]
+    n_saves = int(np.round(depth_max / step)) + 1
+    depth_saves = np.linspace(0.0, depth_max, n_saves)
 
     if verbose:
-        print(f"\ntrace_and_save_depths: saving at {n_saves} depth(s) from 0 to {z_max*1e3:.4g} mm "
-              f"(step = {z_step*1e6:.4g} µm, probing direction = '{probing_direction}', "
+        print(f"\ntrace_and_save_depths: saving at {n_saves} depth(s) from 0 to {depth_max*1e3:.4g} mm "
+              f"(step = {step*1e6:.4g} µm, probing direction = '{probing_direction}', "
               f"jones_components = {comp_indices}).")
 
     # Map depth positions to normalised diffrax time [0, 1].

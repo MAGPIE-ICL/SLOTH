@@ -8,7 +8,7 @@ Physics checks:
      exerts a force proportional to -dne/dx.  Rays starting on the positive-x
      side of the beam should acquire a negative x-velocity (deflected away from
      the high-density side), so their mean x-position must decrease with depth.
-  3. Domain-size validation: requesting z_max larger than the domain raises
+  3. Domain-size validation: requesting depth_max larger than the domain raises
      ValueError.
   4. Output structure: the returned dict has the expected keys and shapes.
   5. Pickle round-trip: data written to disk and reloaded matches the return value.
@@ -118,7 +118,7 @@ class TestOutputStructure:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=500e-6, z_max=1e-3,
+            step=500e-6, depth_max=1e-3,
             output_path=None,
             omega=omega, jitted=True, verbose=False,
         )
@@ -134,7 +134,7 @@ class TestOutputStructure:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=200e-6, z_max=1e-3,
+            step=200e-6, depth_max=1e-3,
             output_path=None,
             omega=omega, verbose=False,
         )
@@ -150,7 +150,7 @@ class TestOutputStructure:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=500e-6, z_max=1e-3,
+            step=500e-6, depth_max=1e-3,
             output_path=None,
             omega=omega, verbose=False,
         )
@@ -166,7 +166,7 @@ class TestOutputStructure:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=500e-6, z_max=1e-3,
+            step=500e-6, depth_max=1e-3,
             output_path=None,
             omega=omega, verbose=False,
         )
@@ -180,17 +180,17 @@ class TestUniformSampling:
         domain = _vacuum_domain()
         omega = 2 * np.pi * c / 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
-        z_step = 200e-6
+        step = 200e-6
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=z_step, z_max=1e-3,
+            step=step, depth_max=1e-3,
             output_path=None,
             omega=omega, verbose=False,
         )
 
         diffs = np.diff(result['depth_saves'])
-        np.testing.assert_allclose(diffs, z_step, rtol=1e-6,
+        np.testing.assert_allclose(diffs, step, rtol=1e-6,
                                    err_msg="depth_saves not uniformly spaced")
 
     def test_starts_at_zero(self):
@@ -200,48 +200,48 @@ class TestUniformSampling:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=300e-6, z_max=900e-6,
+            step=300e-6, depth_max=900e-6,
             output_path=None,
             omega=omega, verbose=False,
         )
 
         assert result['depth_saves'][0] == pytest.approx(0.0)
 
-    def test_ends_at_z_max(self):
+    def test_ends_at_depth_max(self):
         domain = _vacuum_domain()
         omega = 2 * np.pi * c / 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
-        z_max = 800e-6
+        depth_max = 800e-6
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=400e-6, z_max=z_max,
+            step=400e-6, depth_max=depth_max,
             output_path=None,
             omega=omega, verbose=False,
         )
 
-        assert result['depth_saves'][-1] == pytest.approx(z_max)
+        assert result['depth_saves'][-1] == pytest.approx(depth_max)
 
 
 class TestDomainValidation:
     """Check that the function raises when the domain is too small."""
 
     def test_domain_too_small_raises(self):
-        """z_max larger than the domain's probing-direction extent → ValueError."""
+        """depth_max larger than the domain's probing-direction extent → ValueError."""
         # domain spans 4 mm in z; request 10 mm → must raise
         domain = _vacuum_domain(half_size=2e-3)
         omega = 2 * np.pi * c / 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
 
-        with pytest.raises(ValueError, match="smaller than the requested z_max"):
+        with pytest.raises(ValueError, match="smaller than the requested depth_max"):
             trace_and_save_depths(
                 s0, domain,
-                z_step=1e-3, z_max=10e-3,
+                step=1e-3, depth_max=10e-3,
                 output_path=None,
                 omega=omega, verbose=False,
             )
 
-    def test_nonpositive_z_step_raises(self):
+    def test_nonpositive_step_raises(self):
         domain = _vacuum_domain()
         omega = 2 * np.pi * c / 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
@@ -249,12 +249,12 @@ class TestDomainValidation:
         with pytest.raises(ValueError):
             trace_and_save_depths(
                 s0, domain,
-                z_step=-100e-6, z_max=1e-3,
+                step=-100e-6, depth_max=1e-3,
                 output_path=None,
                 omega=omega, verbose=False,
             )
 
-    def test_nonpositive_z_max_raises(self):
+    def test_nonpositive_depth_max_raises(self):
         domain = _vacuum_domain()
         omega = 2 * np.pi * c / 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
@@ -262,7 +262,7 @@ class TestDomainValidation:
         with pytest.raises(ValueError):
             trace_and_save_depths(
                 s0, domain,
-                z_step=200e-6, z_max=0.0,
+                step=200e-6, depth_max=0.0,
                 output_path=None,
                 omega=omega, verbose=False,
             )
@@ -282,7 +282,7 @@ class TestPickle:
         try:
             result = trace_and_save_depths(
                 s0, domain,
-                z_step=500e-6, z_max=1e-3,
+                step=500e-6, depth_max=1e-3,
                 output_path=path,
                 omega=omega, verbose=False,
             )
@@ -305,7 +305,7 @@ class TestPickle:
         with tempfile.TemporaryDirectory() as tmpdir:
             trace_and_save_depths(
                 s0, domain,
-                z_step=500e-6, z_max=1e-3,
+                step=500e-6, depth_max=1e-3,
                 output_path=None,
                 omega=omega, verbose=False,
             )
@@ -328,7 +328,7 @@ class TestVacuumPhysics:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=300e-6, z_max=1.5e-3,
+            step=300e-6, depth_max=1.5e-3,
             output_path=None,
             omega=omega, verbose=False,
         )
@@ -352,7 +352,7 @@ class TestVacuumPhysics:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=300e-6, z_max=1.5e-3,
+            step=300e-6, depth_max=1.5e-3,
             output_path=None,
             omega=omega, verbose=False,
         )
@@ -398,7 +398,7 @@ class TestSlabPhysics:
 
         result = trace_and_save_depths(
             s0, domain,
-            z_step=500e-6, z_max=2e-3,
+            step=500e-6, depth_max=2e-3,
             output_path=None,
             omega=omega, verbose=False,
         )
@@ -433,7 +433,7 @@ class TestJonesComponents:
         s0 = _collimated_rays(Np=6, z_start=-2e-3)
         return trace_and_save_depths(
             s0, domain,
-            z_step=500e-6, z_max=1e-3,
+            step=500e-6, depth_max=1e-3,
             output_path=None,
             omega=omega, jones_components=jones_components, verbose=False,
         )
