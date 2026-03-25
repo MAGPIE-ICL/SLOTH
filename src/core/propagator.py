@@ -829,6 +829,64 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
         ValueError: If the domain length in the probing direction is smaller than depth_max.
         ValueError: If step is not positive or depth_max <= 0.
         ValueError: If jones_components contains an index outside [0, 3].
+
+    Example::
+
+        import numpy as np
+        import jax.numpy as jnp
+        import core.domain as d
+        import core.propagator as p
+        from scipy.constants import c
+
+        # --- parameters ---
+        lwl               = 1064e-9          # laser wavelength (m)
+        probing_direction = 'z'
+        Np                = int(1e5)
+
+        # --- domain ---
+        domain = d.ScalarDomain(
+            lengths, dims,
+            leeway_factor     = 3,
+            ne_type           = "import",
+            probing_direction = probing_direction,
+            Np                = Np,
+            ne                = ne.v * 1e6,  # electron density in m⁻³
+        )
+
+        # --- initial rays (6 × N: x, y, z, vx, vy, vz) ---
+        beam_radius = 500e-6                            # 500 µm beam half-width
+        rng         = np.random.default_rng(0)
+        r           = beam_radius * np.sqrt(rng.random(Np))
+        theta       = 2 * np.pi * rng.random(Np)
+        s0 = jnp.array(np.stack([
+            r * np.cos(theta),                          # x
+            r * np.sin(theta),                          # y
+            np.full(Np, -probing_extent / 2),           # z (entry face)
+            np.zeros(Np),                               # vx
+            np.zeros(Np),                               # vy
+            np.full(Np, c),                             # vz  (propagating in +z)
+        ], axis=0), dtype=jnp.float32)
+
+        # --- trace and save Jones vector every 200 µm up to 1 mm ---
+        result = p.trace_and_save_depths(
+            s0, domain,
+            step       = 200e-6,            # save cadence (m)
+            depth_max  = 1e-3,              # maximum depth (m)
+            output_path= "depth_saves.pkl", # set to None to skip file write
+            lwl        = lwl,
+            jones_components = 'position',  # save transverse positions only
+            verbose    = True,
+        )
+
+        # result['depth_saves']  – 1-D array of save depths (m)
+        # result['jvec']         – list of (2, Np) arrays at each depth
+        # result['jones_components'] – [0, 2]  (rows saved)
+
+        depth_mm = result['depth_saves'] * 1e3
+        for depth, jv in zip(depth_mm, result['jvec']):
+            x_pos = jv[0]          # transverse x at this depth (m)
+            y_pos = jv[1]          # transverse y at this depth (m)
+            print(f"depth={depth:.2f} mm  <x>={x_pos.mean()*1e3:.3f} mm")
     """
 
     import pickle
