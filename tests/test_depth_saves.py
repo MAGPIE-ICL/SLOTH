@@ -113,14 +113,14 @@ class TestOutputStructure:
 
     def test_keys_present(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=8, z_start=-2e-3)
 
         result = trace_and_save_depths(
             s0, domain,
             step=500e-6, depth_max=1e-3,
             output_path=None,
-            omega=omega, jitted=True, verbose=False,
+            lwl=lwl, jitted=True, verbose=False,
         )
 
         assert 'depth_saves' in result
@@ -129,14 +129,14 @@ class TestOutputStructure:
 
     def test_depth_saves_shape(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=8, z_start=-2e-3)
 
         result = trace_and_save_depths(
             s0, domain,
             step=200e-6, depth_max=1e-3,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
         # 0, 200, 400, 600, 800, 1000 µm → 6 save points
         assert len(result['depth_saves']) == 6
@@ -145,14 +145,14 @@ class TestOutputStructure:
     def test_jvec_shapes_all_components(self):
         Np = 10
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=Np, z_start=-2e-3)
 
         result = trace_and_save_depths(
             s0, domain,
             step=500e-6, depth_max=1e-3,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
 
         # Default: all 4 Jones components → (4, Np) at each depth
@@ -161,14 +161,14 @@ class TestOutputStructure:
 
     def test_jones_components_recorded(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
 
         result = trace_and_save_depths(
             s0, domain,
             step=500e-6, depth_max=1e-3,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
         assert result['jones_components'] == [0, 1, 2, 3]
 
@@ -178,7 +178,7 @@ class TestUniformSampling:
 
     def test_spacing(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
         step = 200e-6
 
@@ -186,7 +186,7 @@ class TestUniformSampling:
             s0, domain,
             step=step, depth_max=1e-3,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
 
         diffs = np.diff(result['depth_saves'])
@@ -195,21 +195,21 @@ class TestUniformSampling:
 
     def test_starts_at_zero(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
 
         result = trace_and_save_depths(
             s0, domain,
             step=300e-6, depth_max=900e-6,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
 
         assert result['depth_saves'][0] == pytest.approx(0.0)
 
     def test_ends_at_depth_max(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
         depth_max = 800e-6
 
@@ -217,7 +217,7 @@ class TestUniformSampling:
             s0, domain,
             step=400e-6, depth_max=depth_max,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
 
         assert result['depth_saves'][-1] == pytest.approx(depth_max)
@@ -230,7 +230,7 @@ class TestDomainValidation:
         """depth_max larger than the domain's probing-direction extent → ValueError."""
         # domain spans 4 mm in z; request 10 mm → must raise
         domain = _vacuum_domain(half_size=2e-3)
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
 
         with pytest.raises(ValueError, match="smaller than the requested depth_max"):
@@ -238,12 +238,12 @@ class TestDomainValidation:
                 s0, domain,
                 step=1e-3, depth_max=10e-3,
                 output_path=None,
-                omega=omega, verbose=False,
+                lwl=lwl, verbose=False,
             )
 
     def test_nonpositive_step_raises(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
 
         with pytest.raises(ValueError):
@@ -251,12 +251,12 @@ class TestDomainValidation:
                 s0, domain,
                 step=-100e-6, depth_max=1e-3,
                 output_path=None,
-                omega=omega, verbose=False,
+                lwl=lwl, verbose=False,
             )
 
     def test_nonpositive_depth_max_raises(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
 
         with pytest.raises(ValueError):
@@ -264,7 +264,7 @@ class TestDomainValidation:
                 s0, domain,
                 step=200e-6, depth_max=0.0,
                 output_path=None,
-                omega=omega, verbose=False,
+                lwl=lwl, verbose=False,
             )
 
 
@@ -273,7 +273,7 @@ class TestPickle:
 
     def test_pickle_roundtrip(self):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=6, z_start=-2e-3)
 
         with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
@@ -284,7 +284,7 @@ class TestPickle:
                 s0, domain,
                 step=500e-6, depth_max=1e-3,
                 output_path=path,
-                omega=omega, verbose=False,
+                lwl=lwl, verbose=False,
             )
 
             with open(path, 'rb') as fh:
@@ -299,7 +299,7 @@ class TestPickle:
     def test_none_output_path_no_file(self):
         """Passing output_path=None must not create any file."""
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=4, z_start=-2e-3)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -307,7 +307,7 @@ class TestPickle:
                 s0, domain,
                 step=500e-6, depth_max=1e-3,
                 output_path=None,
-                omega=omega, verbose=False,
+                lwl=lwl, verbose=False,
             )
             assert len(os.listdir(tmpdir)) == 0
 
@@ -323,14 +323,14 @@ class TestVacuumPhysics:
     def test_vacuum_position_unchanged(self):
         Np = 20
         domain = _vacuum_domain(half_size=3e-3, n=16)
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=Np, z_start=-3e-3)
 
         result = trace_and_save_depths(
             s0, domain,
             step=300e-6, depth_max=1.5e-3,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
 
         # Transverse positions at first and last save points should match.
@@ -347,14 +347,14 @@ class TestVacuumPhysics:
     def test_vacuum_angle_unchanged(self):
         Np = 20
         domain = _vacuum_domain(half_size=3e-3, n=16)
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=Np, z_start=-3e-3)
 
         result = trace_and_save_depths(
             s0, domain,
             step=300e-6, depth_max=1.5e-3,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
 
         # All 4 components are saved by default; extract rows 1 and 3 (angles).
@@ -383,7 +383,7 @@ class TestSlabPhysics:
         s = 1.0  # positive gradient in +x
         domain = _slab_domain(half_size=half_size, n=n, ne_0=ne_0, s=s)
 
-        omega = 2 * np.pi * c / 351e-9  # 351 nm — large ncr (∝ 1/λ²) keeps rays below cutoff while still refracting
+        lwl = 351e-9  # 351 nm — large ncr (∝ 1/λ²) keeps rays below cutoff while still refracting
 
         # Start with rays only on the positive-x side, at z = -half_size
         Np = 40
@@ -400,7 +400,7 @@ class TestSlabPhysics:
             s0, domain,
             step=500e-6, depth_max=2e-3,
             output_path=None,
-            omega=omega, verbose=False,
+            lwl=lwl, verbose=False,
         )
 
         # Mean x-position should decrease as rays deflect towards -x
@@ -429,13 +429,13 @@ class TestJonesComponents:
     @staticmethod
     def _run(jones_components):
         domain = _vacuum_domain()
-        omega = 2 * np.pi * c / 1064e-9
+        lwl = 1064e-9
         s0 = _collimated_rays(Np=6, z_start=-2e-3)
         return trace_and_save_depths(
             s0, domain,
             step=500e-6, depth_max=1e-3,
             output_path=None,
-            omega=omega, jones_components=jones_components, verbose=False,
+            lwl=lwl, jones_components=jones_components, verbose=False,
         )
 
     def test_default_saves_all_four_rows(self):

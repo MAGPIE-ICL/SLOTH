@@ -225,7 +225,107 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
         assert "\nWhat."
 
 def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = True, save_points_per_region = 2, memory_debug = False, lwl = 1064e-9, keep_domain = False, return_raw_results = False, verbose = True):
-    
+    """
+    Trace rays through a scalar plasma domain and return their final state as a
+    Jones vector suitable for downstream diagnostics.
+
+    The beam can be supplied either as a pre-created ray matrix or as a compact
+    parameter tuple that is expanded into rays internally (necessary when domain
+    or ray batching is enabled).
+
+    Args:
+        beam (jax.Array or tuple): Either
+
+            * a ``(6, N)`` array of pre-created rays with rows
+              ``(x, y, z, vx, vy, vz)``; or
+            * a tuple ``(beam_size, divergence, ne_extent, probing_direction,
+              beam_type, seeded)`` whose elements are passed directly to
+              ``core.beam.Beam``.  This form is required when
+              ``ScalarDomain.ray_batch_count > 1``.
+
+        ScalarDomain (core.domain.ScalarDomain): Domain object produced by
+            ``core.domain.ScalarDomain``.  Its ``region_count`` and
+            ``ray_batch_count`` attributes control domain and ray batching
+            respectively.
+        probing_depth (float): Maximum propagation depth in metres along the
+            probing direction.
+        parallelise (bool): Use ``jax.vmap`` to parallelise over rays (default
+            ``True``).  Set to ``False`` to use the legacy serial solver
+            (single domain region only).
+        jitted (bool): JIT-compile the ODE solver with ``equinox.filter_jit``
+            (default ``True``).
+        save_points_per_region (int): Number of time-points saved per domain
+            region by the ODE solver (default ``2``, i.e. start and end).
+            Values greater than 2 return intermediate save points as a stacked
+            array.
+        memory_debug (bool): Print memory diagnostics and write a JAX device
+            memory profile to disk (default ``False``).
+        lwl (float): Laser wavelength in metres (default ``1064e-9``).  Used to
+            compute the angular frequency ``omega = 2π·c/lwl``.
+        keep_domain (bool): Reserved for future use (default ``False``).
+        return_raw_results (bool): Return the raw ``diffrax.Solution`` objects
+            instead of the processed Jones vector (default ``False``).
+        verbose (bool): Print progress and shape information (default ``True``).
+
+    Returns:
+        tuple: ``(rf, Jf, duration)``
+
+            * ``rf`` – Jones vector array of shape ``(4, N)`` (or a stacked
+              array of shape ``(n_saves, 4, N)`` when
+              ``save_points_per_region > 2``).  Rows are transverse position
+              and angle pairs; the exact mapping depends on
+              ``probing_direction`` (see ``shared.propagation.ray_to_Jonesvector``).
+            * ``Jf`` – ``None`` (reserved for future polarisation output).
+            * ``duration`` – wall-clock time of the ODE solve in seconds
+              (``numpy.float64``).
+
+            When ``return_raw_results=True`` the tuple is
+            ``(solutions, None, duration)`` where ``solutions`` is a
+            ``numpy`` array of ``diffrax.Solution`` objects.
+
+    Example::
+
+        import jax.numpy as jnp
+        import core.domain as d
+        import core.propagator as p
+
+        # --- domain ---
+        lwl              = 1064e-9          # laser wavelength (m)
+        probing_direction = 'z'
+        Np               = int(1e5)
+
+        domain = d.ScalarDomain(
+            lengths, dims,
+            leeway_factor     = 3,
+            ne_type           = "import",
+            probing_direction = probing_direction,
+            Np                = Np,
+            ne                = ne.v * 1e6,   # electron density in m⁻³
+        )
+
+        # --- beam ---
+        beam_size      = [extent_x, extent_y]  # half-widths (m)
+        probing_extent = extent_z
+        ne_extent      = probing_extent         # initialisation depth
+        divergence     = 0.1e-3                 # half-angle (rad)
+        beam_type      = "rectangular"
+
+        # --- solve ---
+        rf_jax, _, duration = p.solve(
+            (beam_size, divergence, ne_extent, probing_direction, beam_type, False),
+            domain,
+            probing_extent,
+            lwl     = lwl,
+            verbose = False,
+        )
+
+        # rf_jax has shape (4, Np): rows are x, φ_x, y, φ_y
+        # Pass to diagnostics, e.g.:
+        #   import processing.diagnostics as diag
+        #   shadowgrapher = diag.Shadowgraphy(rf_jax, focal_plane=-35)
+        #   shadowgrapher.single_lens_solve()
+    """
+
     omega = 2 * jnp.pi * (c / lwl)
 
     region_count = ScalarDomain.region_count
@@ -667,7 +767,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
 
 def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
-                          omega, jones_components=None, jitted=True,
+                          lwl=1064e-9, jones_components=None, jitted=True,
                           rtol=1e-3, atol=1e-5, verbose=True):
     """
     Trace rays through the domain and save the Jones vector at uniformly-spaced
@@ -702,7 +802,8 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
             The domain length in the probing direction must be >= depth_max.
         output_path (str or None): File path for the output pickle. Pass None to skip
             writing the file (results are still returned).
-        omega (float): Angular frequency of the probing beam, rad/s.
+        lwl (float): Laser wavelength in metres (default 1064e-9). Used to compute
+            the angular frequency ``omega = 2π·c/lwl``.
         jones_components: Selects which rows of the Jones vector to save.
             Accepted values:
 
@@ -728,9 +829,69 @@ def trace_and_save_depths(s0, ScalarDomain, step, depth_max, output_path, *,
         ValueError: If the domain length in the probing direction is smaller than depth_max.
         ValueError: If step is not positive or depth_max <= 0.
         ValueError: If jones_components contains an index outside [0, 3].
+
+    Example::
+
+        import numpy as np
+        import jax.numpy as jnp
+        import core.domain as d
+        import core.propagator as p
+        from scipy.constants import c
+
+        # --- parameters ---
+        lwl               = 1064e-9          # laser wavelength (m)
+        probing_direction = 'z'
+        Np                = int(1e5)
+
+        # --- domain ---
+        domain = d.ScalarDomain(
+            lengths, dims,
+            leeway_factor     = 3,
+            ne_type           = "import",
+            probing_direction = probing_direction,
+            Np                = Np,
+            ne                = ne.v * 1e6,  # electron density in m⁻³
+        )
+
+        # --- initial rays (6 × N: x, y, z, vx, vy, vz) ---
+        beam_radius = 500e-6                            # 500 µm beam half-width
+        rng         = np.random.default_rng(0)
+        r           = beam_radius * np.sqrt(rng.random(Np))
+        theta       = 2 * np.pi * rng.random(Np)
+        s0 = jnp.array(np.stack([
+            r * np.cos(theta),                          # x
+            r * np.sin(theta),                          # y
+            np.full(Np, -probing_extent / 2),           # z (entry face)
+            np.zeros(Np),                               # vx
+            np.zeros(Np),                               # vy
+            np.full(Np, c),                             # vz  (propagating in +z)
+        ], axis=0), dtype=jnp.float32)
+
+        # --- trace and save Jones vector every 200 µm up to 1 mm ---
+        result = p.trace_and_save_depths(
+            s0, domain,
+            step       = 200e-6,            # save cadence (m)
+            depth_max  = 1e-3,              # maximum depth (m)
+            output_path= "depth_saves.pkl", # set to None to skip file write
+            lwl        = lwl,
+            jones_components = 'position',  # save transverse positions only
+            verbose    = True,
+        )
+
+        # result['depth_saves']  – 1-D array of save depths (m)
+        # result['jvec']         – list of (2, Np) arrays at each depth
+        # result['jones_components'] – [0, 2]  (rows saved)
+
+        depth_mm = result['depth_saves'] * 1e3
+        for depth, jv in zip(depth_mm, result['jvec']):
+            x_pos = jv[0]          # transverse x at this depth (m)
+            y_pos = jv[1]          # transverse y at this depth (m)
+            print(f"depth={depth:.2f} mm  <x>={x_pos.mean()*1e3:.3f} mm")
     """
 
     import pickle
+
+    omega = 2 * np.pi * (c / lwl)
 
     if step <= 0 or depth_max <= 0:
         raise ValueError("step and depth_max must be positive.")
