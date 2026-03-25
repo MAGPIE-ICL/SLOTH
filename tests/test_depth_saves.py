@@ -51,7 +51,7 @@ jax.config.update('jax_platform_name', 'cpu')
 class _MinimalDomain:
     """Lightweight stand-in for core.domain.ScalarDomain."""
 
-    def __init__(self, ne, x, y, z, probing_direction='z'):
+    def __init__(self, ne, x, y, z, probing_direction='z', Np_total=None):
         self.ne = jnp.array(ne, dtype=jnp.float32)
         self.x = jnp.array(x, dtype=jnp.float32)
         self.y = jnp.array(y, dtype=jnp.float32)
@@ -59,6 +59,7 @@ class _MinimalDomain:
         self.probing_direction = probing_direction
         self.lengths = jnp.array([x[-1] - x[0], y[-1] - y[0], z[-1] - z[0]], dtype=jnp.float32)
         self.dims = jnp.array([len(x), len(y), len(z)], dtype=jnp.int32)
+        self.Np_total = Np_total
 
 
 def _vacuum_domain(half_size=2e-3, n=16):
@@ -499,3 +500,97 @@ class TestJonesComponents:
     def test_invalid_index_raises(self):
         with pytest.raises(ValueError, match="out of range"):
             self._run([0, 5])
+
+
+class TestBeamTupleInput:
+    """
+    Verify that trace_and_save_depths accepts a beam parameter tuple
+    (beam_size, divergence, ne_extent, probing_direction, beam_type, seeded)
+    and produces results equivalent to passing a pre-built s0 array.
+
+    The number of rays is NOT in the tuple; it is taken from
+    ScalarDomain.Np_total, which must be set on the domain.
+    """
+
+    _Np = 20
+    _half_size = 2e-3
+
+    @staticmethod
+    def _domain_with_np(Np, half_size=2e-3, n=16):
+        coords = np.linspace(-half_size, half_size, n)
+        ne = np.zeros((n, n, n), dtype=np.float32)
+        return _MinimalDomain(ne, coords, coords, coords,
+                              probing_direction='z', Np_total=Np)
+
+    def test_tuple_produces_result(self):
+        """Tuple form must return a result with the correct structure."""
+        Np = self._Np
+        domain = self._domain_with_np(Np)
+        beam_tuple = (200e-6, 0.0, self._half_size, 'z', 'circular', True)
+
+        result = trace_and_save_depths(
+            beam_tuple, domain,
+            step=500e-6, depth_max=1e-3,
+            output_path=None,
+            lwl=1064e-9, verbose=False,
+        )
+
+        assert 'depth_saves' in result
+        assert 'jvec' in result
+        assert 'jones_components' in result
+        for arr in result['jvec']:
+            assert arr.shape == (4, Np), f"Unexpected jvec shape: {arr.shape}"
+
+    def test_tuple_matches_prebuilt_s0(self):
+        """Results from tuple and from the equivalent pre-built s0 must be identical."""
+        from core.beam import Beam
+
+        Np = self._Np
+        half_size = self._half_size
+        domain = self._domain_with_np(Np, half_size=half_size)
+
+        beam_size      = 200e-6
+        divergence     = 0.0
+        ne_extent      = half_size
+        probing_dir    = 'z'
+        beam_type      = 'circular'
+        seeded         = True
+
+        beam_tuple = (beam_size, divergence, ne_extent, probing_dir, beam_type, seeded)
+        s0_prebuilt = Beam(Np, beam_size=beam_size, divergence=divergence,
+                           ne_extent=ne_extent, probing_direction=probing_dir,
+                           beam_type=beam_type, seeded=seeded).s0
+
+        result_tuple = trace_and_save_depths(
+            beam_tuple, domain,
+            step=500e-6, depth_max=1e-3,
+            output_path=None, lwl=1064e-9, verbose=False,
+        )
+        result_s0 = trace_and_save_depths(
+            s0_prebuilt, domain,
+            step=500e-6, depth_max=1e-3,
+            output_path=None, lwl=1064e-9, verbose=False,
+        )
+
+        np.testing.assert_array_equal(result_tuple['depth_saves'], result_s0['depth_saves'])
+        for j in range(len(result_tuple['jvec'])):
+            np.testing.assert_array_equal(
+                result_tuple['jvec'][j], result_s0['jvec'][j],
+                err_msg=f"jvec mismatch at depth index {j} between tuple and s0 forms",
+            )
+
+    def test_tuple_without_np_total_raises(self):
+        """If domain lacks Np_total (None), an AssertionError must be raised."""
+        domain_no_np = _MinimalDomain(  # Np_total defaults to None
+            np.zeros((16, 16, 16), dtype=np.float32),
+            *[np.linspace(-2e-3, 2e-3, 16)] * 3,
+            Np_total=None,
+        )
+        beam_tuple = (200e-6, 0.0, self._half_size, 'z', 'circular', False)
+
+        with pytest.raises(AssertionError, match="Np_total must be set"):
+            trace_and_save_depths(
+                beam_tuple, domain_no_np,
+                step=500e-6, depth_max=1e-3,
+                output_path=None, lwl=1064e-9, verbose=False,
+            )
