@@ -12,25 +12,10 @@ src/shared/__pycache__
 src/utils/__pycache__
 
 examples/notebooks/.ipynb_checkpoints
-
-evaluation/benchmarks/memory/memory-*
-evaluation/benchmarks/memory/domain_vs_rays_*
-
-evaluation/benchmarks/runtime/benchmark*
-*.csv
-*.pdf
-evaluation/benchmarks/runtime/*.txt
-*.png
-*.zip
-*.gz
-*.tar
-*.hdf5
+examples/*.pkl
+examples/*.p
 
 *.spk
-
-evaluation/benchmarks/turbBoxLargeTest/radmeshablation_3d_prp_CH_ug_3rd_hdf5_plt_cnt_0228
-
-evaluation/interferometry_testing/.ipynb_checkpoints
 
 examples/jobs/run_scripts/.ipynb_checkpoints
 
