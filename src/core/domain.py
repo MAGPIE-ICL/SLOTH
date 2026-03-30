@@ -76,8 +76,13 @@ class ScalarDomain(eqx.Module):
     Np_total: np.int64
     ray_batch_count: np.int64
 
+    inv_brems: bool
+    Te: jax.Array
+    Z: jnp.float32
+
     def __init__(self, lengths, dims, *, ne_type = None, probing_direction = 'z', auto_batching = True, iteration = 1, region_count = 1, leeway_factor = None, coord_backup = None, future_dims = None, extra_info = False, memory_reporting = False, memory_limit = None, Np = None,
-        s = None, s1 = None, s2 = None, Ly = None, ne_0 = None, ne = None):
+        s = None, s1 = None, s2 = None, Ly = None, ne_0 = None, ne = None,
+        inv_brems = False, Te = None, Z = None):
         """
         A class to set-up/generate the scalar simulation domains and store for later use.
 
@@ -127,9 +132,20 @@ class ScalarDomain(eqx.Module):
         + plus an assortment of parameters for domain generation that can be set to override defaults
             (s, s1, s2, Ly, ne_0, ne)
 
+        :param inv_brems: Enable inverse bremsstrahlung amplitude attenuation.
+        :type inv_brems: bool, default: False
+
+        :param Te: Electron temperature field in eV.  Can be a scalar (applied uniformly) or
+            a 3-D array with the same shape as *ne*.  Required when *inv_brems* is True.
+        :type Te: float or jax.Array, default: None
+
+        :param Z: Mean ion charge state (dimensionless).  Required when *inv_brems* is True.
+        :type Z: float, default: None
+
         :raise Exception: If lengths or dims are an array of len(...) != 1 but not len(...) == 3
         :raise AssertionError: If ne_type is changed from the default but not set to a valid type.
         :raise AssertionError: If probing_direction is not == "x", "y" or "z".
+        :raise AssertionError: If inv_brems is True but Te or Z are not supplied.
 
         :return: Returns an equinox.Module inheriting object containing information about and the generated/imported domain itself.
         :rtype: core.domain.ScalarDomain
@@ -161,6 +177,16 @@ class ScalarDomain(eqx.Module):
         self.probing_direction = probing_direction
 
         self.ne_type = ne_type
+
+        # Inverse bremsstrahlung parameters
+        assert not inv_brems or (Te is not None and Z is not None), \
+            colour.BOLD + "\nTe and Z must both be provided when inv_brems=True." + colour.END
+        self.inv_brems = inv_brems
+        if Te is not None:
+            self.Te = jnp.asarray(Te, dtype=jnp.float32)
+        else:
+            self.Te = None
+        self.Z = jnp.float32(Z) if Z is not None else None
 
         # working with 10% leeway in estimate for now
         if leeway_factor is not None:

@@ -63,28 +63,83 @@ def dndr(r, gradient_term, omega, x, y, z):
 
     return grad
 
+def kappa_inv_brems(ne, Te, Z, omega):
+    """
+    Compute the inverse bremsstrahlung amplitude absorption rate [1/s] at each
+    grid point using the NRL formulary (NRL Plasma Formulary, p.58).
+
+    This follows the same approach as the legacy full_solver implementation.
+    The absorption coefficient is always non-negative; it is used in the ray-
+    tracing ODE as ``da/dt = -kappa * a`` so that amplitude decreases
+    monotonically as rays travel through the plasma.
+
+    Args:
+        ne  (jax.Array or float): Electron density in m\ :sup:`-3`.
+        Te  (jax.Array or float): Electron temperature in eV.  May be a scalar
+            (uniform temperature) or a 3-D array with the same shape as *ne*.
+        Z   (float): Mean ion charge state (dimensionless).
+        omega (float): Laser angular frequency in rad/s.
+
+    Returns:
+        jax.Array: Absorption rate with the same shape as *ne*, units of 1/s.
+    """
+    from scipy.constants import e as e_charge
+
+    ne_cc = ne * 1e-6  # convert m^-3 to cm^-3
+
+    # Electron thermal speed (m/s), Te in eV
+    v_the = 4.19e5 * jnp.sqrt(Te)
+
+    # Plasma frequency (rad/s), ne_cc in cm^-3
+    o_pe = 5.64e4 * jnp.sqrt(ne_cc)
+
+    # Upper limit for Coulomb logarithm argument: max(omega_pe, omega)
+    o_max = jnp.maximum(o_pe, omega)
+
+    # Classical and quantum minimum impact parameters
+    L_classical = Z * e_charge / Te                          # Z * e [C] / Te [eV] = Z * e / (Te * e) [m] → metres
+    L_quantum   = 2.760428269727312e-10 / jnp.sqrt(Te)      # hbar/sqrt(m_e * e) / sqrt(Te[eV]) [m]; constant = hbar/sqrt(m_e*e) in SI
+    L_max       = jnp.maximum(L_classical, L_quantum)
+
+    # Coulomb logarithm (clamped to ≥ 2)
+    CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * L_max)))
+
+    return 3.1e-5 * Z * c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
+
+
 # ODEs of photon paths, standalone function to support the solve()
-def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
+def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims, kappa=None):
     """
     Returns an array with the gradients and velocity per ray for ode_int
 
+    When *kappa* is ``None`` the state vector has 6 elements per ray
+    ``(x, y, z, vx, vy, vz)``.  When *kappa* is a 3-D JAX array (the
+    pre-computed inverse bremsstrahlung absorption rate) the state vector has 7
+    elements per ray, with the 7th element being the local ray amplitude *a*.
+    The amplitude ODE is ``da/dt = -kappa(r) * a`` (absorption).
+
     Args:
         t (float array): I think this is a dummy variable for ode_int - our problem is time invarient
-        s (6N float array): flattened 6xN array of rays used by ode_int
+        s (6N or 7N float array): flattened 6xN (or 7xN) array of rays used by ode_int
         ScalarDomain (ScalarDomain): an ScalarDomain object which can calculate gradients
+        kappa (jax.Array or None): pre-computed inverse bremsstrahlung absorption rate
+            grid [1/s] on the same (x, y, z) coordinate grid.  Pass ``None``
+            (default) to disable inverse bremsstrahlung.
 
     Returns:
-        6N float array: flattened array for ode_int
+        6N or 7N float array: flattened array for ode_int
     """
+
+    nstate = 7 if kappa is not None else 6
 
     if not parallelise:
         print("False")
         # jnp.reshape() auto converts to a jax array rather than having to do after a numpy reshape
-        s = jnp.reshape(s, (6, s.size // 6))
+        s = jnp.reshape(s, (nstate, s.size // nstate))
     else:
         print("True")
         # forces s to be a matrix even if has the indexes of a 1d array such that dsdt() can be generalised
-        s = jnp.reshape(s, (6, 1))  # one ray per vmap iteration if parallelised
+        s = jnp.reshape(s, (nstate, 1))  # one ray per vmap iteration if parallelised
 
     sprime = jnp.zeros_like(s)
 
@@ -92,6 +147,10 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
     # needs to be before the reshape to avoid indexing errors
     r = s[:3, :].T  # transposed so it is of the correct shape for interpolators
     v = s[3:6, :]
+
+    # Extract amplitude before deleting s (only relevant when kappa is provided)
+    if kappa is not None:
+        a = s[6, :]
 
     # was deleting before it needed using before by accident - obviously caused issues (AbstractTerm error)
     # - fine to delete after used, only one slice of s0 rather than deleting s0
@@ -104,6 +163,11 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims):
     # r must be transposed within dndr(...) else we get an AbstractTerm error due to the effect on the return value
     sprime = sprime.at[3:6, :].set(dndr(r, gradient_term, omega, x, y, z))
     sprime = sprime.at[:3, :].set(v)
+
+    # Inverse bremsstrahlung amplitude attenuation: da/dt = -kappa(r) * a
+    if kappa is not None:
+        kappa_at_r = trilinearInterpolator((x, y, z), kappa, r, fill_value=0.0)
+        sprime = sprime.at[6, :].set(-kappa_at_r * a)
 
     ###
     ### Sort out passed functions and objects
@@ -482,12 +546,23 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             # think we should change this???
 
             # passed args must be hashable to be made static for jax.jit, tuple is hashable, array & dict are not
+            inv_brems = getattr(ScalarDomain, 'inv_brems', False)
+            kappa_grid = None
+            if inv_brems:
+                kappa_grid = kappa_inv_brems(
+                    ScalarDomain.ne,
+                    ScalarDomain.Te,
+                    float(ScalarDomain.Z),
+                    omega,
+                )
+
             args = (
                 parallelise, 
                 ScalarDomain.ne,
                 ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
                 omega, 
-                ScalarDomain.lengths, ScalarDomain.dims
+                ScalarDomain.lengths, ScalarDomain.dims,
+                kappa_grid,
             )
 
             ###
@@ -521,6 +596,10 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
                 if i == 1:
                     s0_transformed = s0_import.T
+                    # When inv_brems is enabled, append an amplitude column (1.0)
+                    if inv_brems:
+                        amplitude_init = jnp.ones((Np, 1), dtype=s0_import.dtype)
+                        s0_transformed = jnp.concatenate([s0_transformed, amplitude_init], axis=1)
                     del s0_import
                 else:
                     # change target_depth back to trace_depth and check the difference
@@ -943,10 +1022,21 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
     n_saves = int(np.round(depth_max / step)) + 1
     depth_saves = np.linspace(0.0, depth_max, n_saves)
 
+    # ── Inverse bremsstrahlung ────────────────────────────────────────────────
+    inv_brems = getattr(ScalarDomain, 'inv_brems', False)
+    kappa = None
+    if inv_brems:
+        kappa = kappa_inv_brems(
+            ScalarDomain.ne,
+            ScalarDomain.Te,
+            float(ScalarDomain.Z),
+            omega,
+        )
+
     if verbose:
         print(f"\ntrace_and_save_depths: saving at {n_saves} depth(s) from 0 to {depth_max*1e3:.4g} mm "
               f"(step = {step*1e6:.4g} µm, probing direction = '{probing_direction}', "
-              f"jones_components = {comp_indices}).")
+              f"jones_components = {comp_indices}, inv_brems = {inv_brems}).")
 
     # Map depth positions to normalised diffrax time [0, 1].
     # The ODE solver normalises real time by norm_factor = sqrt(8)*trace_depth/c so
@@ -963,6 +1053,7 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
         ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
         omega,
         ScalarDomain.lengths, ScalarDomain.dims,
+        kappa,
     )
 
     def dsdt_ODE(t, y, args):
@@ -993,31 +1084,43 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
         from equinox import filter_jit
         _ode_solve = filter_jit(_ode_solve)
 
-    # vmap over rays; each call handles one ray (shape (6,))
-    s0_T = s0.T  # shape (N, 6)
+    # When inv_brems is enabled, append an amplitude column (initialised to 1)
+    # to each ray so the state vector is (7,) per ray.
+    if inv_brems:
+        amplitude_init = jnp.ones((Np, 1), dtype=s0.dtype)
+        s0_T = jnp.concatenate([s0.T, amplitude_init], axis=1)  # shape (N, 7)
+    else:
+        s0_T = s0.T  # shape (N, 6)
+
     sol = jax.block_until_ready(
         jax.vmap(_ode_solve, in_axes=(0, None))(s0_T, args)
     )
 
-    # sol.ys has shape (N, n_saves, 6).
+    # sol.ys has shape (N, n_saves, 6) [or (N, n_saves, 7) with inv_brems].
     # For each depth snapshot: compute the full 4-row Jones vector via
     # ray_to_Jonesvector (keep_current_plane=True records the actual position
     # and angle at that depth, not propagated to the exit plane), then keep
     # only the user-requested rows.
     jvec_list = []
+    amp_list  = [] if inv_brems else None
 
     for j in range(n_saves):
-        rays_j = sol.ys[:, j, :].T  # shape (6, N)
+        rays_j = sol.ys[:, j, :6].T  # shape (6, N)  — rows 0-5 always
         jvec_full, _ = ray_to_Jonesvector(rays_j, keep_current_plane=True,
                                            probing_direction=probing_direction)
         # jvec_full rows: [pos_axis1, angle_axis1, pos_axis2, angle_axis2]
         jvec_list.append(np.asarray(jvec_full)[comp_indices, :])  # (n_comp, N)
+
+        if inv_brems:
+            amp_list.append(np.asarray(sol.ys[:, j, 6]))  # (N,)
 
     result = {
         'depth_saves': depth_saves,
         'jvec': jvec_list,
         'jones_components': comp_indices,
     }
+    if inv_brems:
+        result['amplitude'] = amp_list
 
     if output_path is not None:
         with open(output_path, 'wb') as fh:
