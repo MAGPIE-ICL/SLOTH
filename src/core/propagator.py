@@ -176,7 +176,7 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims, kappa=None):
     # Keep derivative shape consistent with solver state shape (flattened 1D state vector).
     return jnp.ravel(sprime)
    
-def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose):
+def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose, inv_brems=False):
     """
     #for i in enumerate(sol.result):
     #    print(i)
@@ -248,10 +248,18 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
         print("and transpose into the form:", solutions[0].ys.shape, "to work with later code.")
 
     if save_points_per_region == 2 or save_points_per_region == 1:
-        rf = solutions[0].ys[:, -1, :].T
+        rf_state = solutions[0].ys[:, -1, :].T  # shape (6 or 7, N)
 
-        # depth_traced + trace_depth or just trace_depth
-        return *ray_to_Jonesvector(rf, ne_extent = depth_traced + trace_depth, probing_direction = probing_direction), duration
+        # Use keep_current_plane=True so that rays are recorded at their actual
+        # positions — consistent with trace_and_save_depths.
+        rf_geo, _ = ray_to_Jonesvector(rf_state[:6, :], keep_current_plane=True,
+                                        probing_direction=probing_direction)
+
+        if inv_brems and rf_state.shape[0] == 7:
+            amp = np.asarray(rf_state[6, :])              # (N,) per-ray amplitude
+            rf_weighted = np.asarray(rf_geo) * amp[np.newaxis, :]
+            return rf_weighted, np.asarray(rf_geo), duration
+        return rf_geo, None, duration
     elif save_points_per_region > 2:
         slice_rf_list = []
         slice_Jf_list = []
@@ -334,12 +342,15 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
     Returns:
         tuple: ``(rf, Jf, duration)``
 
-            * ``rf`` – Jones vector array of shape ``(4, N)`` (or a stacked
-              array of shape ``(n_saves, 4, N)`` when
-              ``save_points_per_region > 2``).  Rows are transverse position
-              and angle pairs; the exact mapping depends on
+            * ``rf`` – Jones vector array of shape ``(4, N)``.  Rows are
+              transverse position and angle pairs; the exact mapping depends on
               ``probing_direction`` (see ``shared.propagation.ray_to_Jonesvector``).
-            * ``Jf`` – ``None`` (reserved for future polarisation output).
+              When ``ScalarDomain.inv_brems=True`` each column is multiplied by
+              the corresponding per-ray amplitude so that attenuation is already
+              baked into the output.
+            * ``Jf`` – When ``ScalarDomain.inv_brems=True``: the unweighted
+              (geometric) Jones vector of the same shape as ``rf``, useful for
+              sanity-checking the amplitude weighting.  ``None`` otherwise.
             * ``duration`` – wall-clock time of the ODE solve in seconds
               (``numpy.float64``).
 
@@ -836,10 +847,11 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             return solutions, None, duration
         else:
             if not parallelise:
-                return *ray_to_Jonesvector(solutions.ys[:,-1].reshape(6, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction), duration
+                rf_geo, _ = ray_to_Jonesvector(solutions.ys[:,-1].reshape(6, Np), keep_current_plane=True, probing_direction = ScalarDomain.probing_direction)
+                return rf_geo, None, duration
             else:
                 # need to confirm there is no mismatch between total depth_traced and the target probing_depth
-                return process_results(solutions, depth_traced, trace_depth, ScalarDomain.probing_direction, duration, save_points_per_region, ray_batch_count, verbose)
+                return process_results(solutions, depth_traced, trace_depth, ScalarDomain.probing_direction, duration, save_points_per_region, ray_batch_count, verbose, inv_brems=inv_brems)
     else:
         print("\nData output as a hdf4.tar.gz file due to limitations of vram/ram space.")
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")
@@ -907,11 +919,21 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
 
     Returns:
         dict: Keys:
-            ``depth_saves``       – 1-D numpy array of depth positions along the
-                                    probing axis (metres).
-            ``jvec``              – list of ``(n_components, N)`` numpy arrays; the
-                                    selected Jones-vector rows at each depth.
-            ``jones_components``  – list of int indices recording which rows were saved.
+            ``depth_saves``         – 1-D numpy array of depth positions along the
+                                      probing axis (metres).
+            ``jvec``                – list of ``(n_components, N)`` numpy arrays; the
+                                      selected Jones-vector rows at each depth.  When
+                                      ``ScalarDomain.inv_brems=True`` each column is
+                                      multiplied by the corresponding per-ray amplitude
+                                      so attenuation is already baked in.
+            ``jones_components``    – list of int indices recording which rows were saved.
+            ``amplitude``           – *(only when inv_brems=True)* list of ``(N,)`` numpy
+                                      arrays containing the raw per-ray amplitude at each
+                                      depth snapshot.
+            ``jvec_unweighted``     – *(only when inv_brems=True)* list of
+                                      ``(n_components, N)`` numpy arrays; the geometric
+                                      Jones vector **before** amplitude weighting, useful
+                                      for sanity-checking the attenuation.
 
     Raises:
         ValueError: If the domain length in the probing direction is smaller than depth_max.
@@ -1101,18 +1123,28 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
     # ray_to_Jonesvector (keep_current_plane=True records the actual position
     # and angle at that depth, not propagated to the exit plane), then keep
     # only the user-requested rows.
-    jvec_list = []
-    amp_list  = [] if inv_brems else None
+    # When inv_brems is active the per-ray amplitude is also extracted and used
+    # to weight the Jones vector so that attenuation is baked into jvec.  The
+    # unweighted geometric Jones vector is preserved in jvec_unweighted for
+    # sanity-checking.
+    jvec_list            = []
+    jvec_unweighted_list = [] if inv_brems else None
+    amp_list             = [] if inv_brems else None
 
     for j in range(n_saves):
         rays_j = sol.ys[:, j, :6].T  # shape (6, N)  — rows 0-5 always
         jvec_full, _ = ray_to_Jonesvector(rays_j, keep_current_plane=True,
                                            probing_direction=probing_direction)
         # jvec_full rows: [pos_axis1, angle_axis1, pos_axis2, angle_axis2]
-        jvec_list.append(np.asarray(jvec_full)[comp_indices, :])  # (n_comp, N)
+        jvec_unweighted = np.asarray(jvec_full)[comp_indices, :]  # (n_comp, N)
 
         if inv_brems:
-            amp_list.append(np.asarray(sol.ys[:, j, 6]))  # (N,)
+            amp_j = np.asarray(sol.ys[:, j, 6])    # (N,) per-ray amplitude
+            amp_list.append(amp_j)
+            jvec_list.append(jvec_unweighted * amp_j[np.newaxis, :])
+            jvec_unweighted_list.append(jvec_unweighted)
+        else:
+            jvec_list.append(jvec_unweighted)
 
     result = {
         'depth_saves': depth_saves,
@@ -1120,7 +1152,8 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
         'jones_components': comp_indices,
     }
     if inv_brems:
-        result['amplitude'] = amp_list
+        result['amplitude']        = amp_list
+        result['jvec_unweighted']  = jvec_unweighted_list
 
     if output_path is not None:
         with open(output_path, 'wb') as fh:

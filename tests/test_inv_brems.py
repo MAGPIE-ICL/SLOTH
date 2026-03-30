@@ -290,3 +290,76 @@ class TestNoAmplitudeKeyWithoutIB:
         assert 'amplitude' not in result, (
             "Did not expect 'amplitude' key when inv_brems is False"
         )
+        assert 'jvec_unweighted' not in result, (
+            "Did not expect 'jvec_unweighted' key when inv_brems is False"
+        )
+
+
+class TestWeightedJvec:
+    """
+    When inv_brems=True the returned jvec must be the amplitude-weighted Jones
+    vector, and jvec_unweighted must equal jvec / amplitude.
+    """
+
+    NE_VAL = 1e25
+    TE_VAL = 100.0
+    Z_VAL  = 1.0
+    LWL    = 1064e-9
+    HALF   = 3e-3
+
+    def _run(self):
+        domain = _uniform_plasma_domain(
+            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            half_size=self.HALF, n=20,
+        )
+        s0 = _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
+        return trace_and_save_depths(
+            s0, domain,
+            step=500e-6, depth_max=2e-3,
+            output_path=None,
+            lwl=self.LWL, jitted=True, verbose=False,
+        )
+
+    def test_jvec_unweighted_key_present(self):
+        result = self._run()
+        assert 'jvec_unweighted' in result, (
+            "Expected 'jvec_unweighted' key when inv_brems=True"
+        )
+
+    def test_jvec_weighted_equals_unweighted_times_amplitude(self):
+        """jvec[j] must equal jvec_unweighted[j] * amplitude[j][newaxis]."""
+        result = self._run()
+        for j, (jv_w, jv_u, amp_j) in enumerate(
+            zip(result['jvec'], result['jvec_unweighted'], result['amplitude'])
+        ):
+            expected = jv_u * np.asarray(amp_j)[np.newaxis, :]
+            np.testing.assert_allclose(
+                jv_w, expected, rtol=1e-6,
+                err_msg=f"jvec weighted/unweighted mismatch at depth index {j}",
+            )
+
+    def test_jvec_weighted_smaller_than_unweighted(self):
+        """
+        In an absorbing plasma the amplitude < 1, so |jvec| < |jvec_unweighted|
+        at the final depth (ignoring the zero-position depth 0).
+        """
+        result = self._run()
+        # Compare RMS magnitudes at the final save depth (index > 0)
+        jv_w = result['jvec'][-1]
+        jv_u = result['jvec_unweighted'][-1]
+        rms_w = float(np.sqrt(np.mean(jv_w ** 2)))
+        rms_u = float(np.sqrt(np.mean(jv_u ** 2)))
+        assert rms_w < rms_u, (
+            f"Expected weighted jvec RMS ({rms_w:.6f}) < unweighted ({rms_u:.6f})"
+        )
+
+    def test_jvec_unweighted_shape_matches_jvec(self):
+        result = self._run()
+        for j, (jv_w, jv_u) in enumerate(
+            zip(result['jvec'], result['jvec_unweighted'])
+        ):
+            assert jv_w.shape == jv_u.shape, (
+                f"Shape mismatch at depth {j}: jvec {jv_w.shape} vs "
+                f"jvec_unweighted {jv_u.shape}"
+            )
+
