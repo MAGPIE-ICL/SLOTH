@@ -248,3 +248,127 @@ def test_multiple_rays(lwl, tol_name):
         assert err < max(tol.pos_atol, abs(y_ana) * tol.pos_rtol), \
             (f"y mismatch (lwl={lwl:.0e}, y0={y0}): "
              f"num={y_num:.6e}, ana={y_ana:.6e}, err={err:.2e}")
+
+
+# ---------------------------------------------------------------------------
+# Inverse bremsstrahlung test
+# ---------------------------------------------------------------------------
+
+_INV_BREMS_CASES = [
+    pytest.param(351e-9,  id="351nm"),
+    pytest.param(702e-9,  id="702nm"),
+    pytest.param(1053e-9, id="1053nm"),
+]
+
+
+class _MinimalDomainIB:
+    """Lightweight domain stub with inv_brems fields for trace_and_save_depths."""
+
+    def __init__(self, ne, x, y, z, Te, Z, probing_direction='x'):
+        self.ne = jnp.array(ne, dtype=jnp.float32)
+        self.x  = jnp.array(x,  dtype=jnp.float32)
+        self.y  = jnp.array(y,  dtype=jnp.float32)
+        self.z  = jnp.array(z,  dtype=jnp.float32)
+        self.probing_direction = probing_direction
+        self.lengths = jnp.array(
+            [x[-1] - x[0], y[-1] - y[0], z[-1] - z[0]], dtype=jnp.float32
+        )
+        self.dims = jnp.array([len(x), len(y), len(z)], dtype=jnp.int32)
+        self.Np_total = None
+
+        self.inv_brems = True
+        self.Te = jnp.asarray(Te, dtype=jnp.float32)
+        self.Z  = jnp.asarray(Z,  dtype=jnp.float32)
+
+
+@pytest.mark.parametrize("lwl", _INV_BREMS_CASES)
+def test_inv_brems_quadratic_trough(lwl):
+    """Verify that inverse bremsstrahlung attenuates amplitude correctly
+    in the quadratic trough.
+
+    Physics checks:
+      1. Amplitude at entry depth (t=0) is 1.0 (no absorption yet).
+      2. Amplitude at exit is strictly less than 1 (absorption occurred).
+      3. Amplitude is positive (no underflow / sign flips).
+      4. jvec_weighted = jvec_unweighted * amplitude (consistency).
+      5. kappa_inv_brems is non-negative everywhere.
+
+    Te=100keV, Z=1 keeps absorption moderate (tau ~ 0.1–1) so amplitude
+    is measurably attenuated but doesn't underflow to zero.
+    """
+    from core.propagator import trace_and_save_depths, kappa_inv_brems
+
+    ncr  = _critical_density(lwl)
+    omega = 2.0 * np.pi * c / lwl
+
+    # Build ne grid (same quadratic trough)
+    x = np.linspace(-X_LENGTH / 2, X_LENGTH / 2, NX)
+    y = np.linspace(-Y_LENGTH / 2, Y_LENGTH / 2, NY)
+    z = np.linspace(-Z_LENGTH / 2, Z_LENGTH / 2, NZ)
+    _, YY, _ = np.meshgrid(x, y, z, indexing='ij')
+    ne = (ncr / 2.0) * (1.0 + YY ** 2 / YC ** 2)
+
+    # Plasma parameters: high Te + low Z keeps kappa moderate so
+    # the optical depth over 10 cm doesn't cause underflow.
+    Te_eV = 1e5     # 100 keV electron temperature
+    Z_ion = 1.0     # hydrogen
+
+    domain_ib = _MinimalDomainIB(ne, x, y, z, Te=Te_eV, Z=Z_ion,
+                                  probing_direction='x')
+
+    # Single ray at y0 = 1 cm
+    y0 = 0.01
+    ne_y0 = (ncr / 2.0) * (1.0 + y0 ** 2 / YC ** 2)
+    n_y0 = float(np.sqrt(1.0 - ne_y0 / ncr))
+    vx0 = c * n_y0
+
+    s0 = jnp.zeros((6, 1))
+    s0 = s0.at[0, 0].set(-X_LENGTH / 2.0)
+    s0 = s0.at[1, 0].set(y0)
+    s0 = s0.at[3, 0].set(vx0)
+
+    depth_max = PROBING_DEPTH
+    step = depth_max / 2  # save at 0, half, and full depth
+    result = trace_and_save_depths(
+        s0, domain_ib, step=step, depth_max=depth_max, output_path=None,
+        lwl=lwl, jones_components='all', jitted=True, verbose=False,
+    )
+
+    # --- 1. Amplitude key present ---
+    assert 'amplitude' in result, "inv_brems result must contain 'amplitude' key"
+    assert 'jvec_unweighted' in result, "inv_brems result must contain 'jvec_unweighted'"
+
+    # --- 2. Amplitude at entry is 1.0 ---
+    amp_entry = result['amplitude'][0]
+    np.testing.assert_allclose(amp_entry, 1.0, atol=1e-6,
+                               err_msg="amplitude at entry should be 1.0")
+
+    # --- 3. Amplitude at exit is 0 < a < 1 ---
+    amp_final = result['amplitude'][-1]
+    assert np.all(amp_final > 0), \
+        f"amplitude must be positive (got {amp_final})"
+    assert np.all(amp_final < 1.0), \
+        f"amplitude must be < 1 (got {float(amp_final[0]):.6f})"
+
+    # --- 4. Monotonic decay: amplitude at mid-depth >= amplitude at exit ---
+    amp_mid = result['amplitude'][1]
+    assert np.all(amp_mid >= amp_final - 1e-7), \
+        "amplitude must decrease monotonically with depth"
+
+    # --- 5. Weighted = unweighted * amplitude ---
+    for j in range(len(result['jvec'])):
+        jvec_w  = result['jvec'][j]
+        jvec_uw = result['jvec_unweighted'][j]
+        amp_j   = result['amplitude'][j]
+        expected = jvec_uw * amp_j[np.newaxis, :]
+        np.testing.assert_allclose(jvec_w, expected, atol=1e-10,
+                                   err_msg=f"jvec mismatch at depth index {j}")
+
+    # --- 6. kappa is non-negative ---
+    kappa = kappa_inv_brems(
+        jnp.asarray(ne, dtype=jnp.float32),
+        jnp.float32(Te_eV),
+        jnp.float32(Z_ion),
+        omega,
+    )
+    assert np.all(np.asarray(kappa) >= 0), "kappa_inv_brems must be non-negative"
