@@ -36,31 +36,63 @@ def omega_pe(ne):
 def n_refrac(ne, omega):
     return jnp.sqrt(1.0 - (omega_pe(ne * 1e-6) / omega) ** 2)
 
-def dndr(r, gradient_term, omega, x, y, z):
+def precompute_gradients(ne, x, y, z, omega):
     """
-    Returns the gradient at the locations r
+    Pre-compute the spatial gradients of the refractive-index driving term once,
+    before the ODE solve.  Passing the resulting arrays into the ODE function
+    avoids repeating the full-grid ``jnp.gradient`` calls at every adaptive
+    time step.
+
+    The driving term is::
+
+        gradient_term = -0.5 * c² * ne / (3.14207787e-4 * ω²)
+
+    where ``3.14207787e-4 = mₑ ε₀ / e²`` (SI).
+
+    The scalar coefficient ``-0.5 * c² / (3.14207787e-4 * ω²)`` is evaluated
+    in float64 and then multiplied into the (potentially float32) *ne* array.
+    This ordering prevents float32 overflow: computing ``c² * ne`` first would
+    overflow for ``ne ≳ 4×10²²`` m⁻³ (since c² ≈ 9×10¹⁶ and float32 max ≈
+    3.4×10³⁸), whereas the coefficient itself is ≈ −4.6×10⁻¹¹ so the product
+    remains well within float32 range for any sub-critical plasma.
 
     Args:
-        r (3xN float): N [x, y, z] locations
+        ne    (jax.Array): Electron density grid in m⁻³, shape ``(Nx, Ny, Nz)``.
+        x, y, z (jax.Array): 1-D coordinate arrays in metres.
+        omega (float): Laser angular frequency in rad/s.
 
     Returns:
-        3 x N float: N [dx, dy, dz] electron density gradients
+        tuple: ``(dndx, dndy, dndz)`` — each a ``(Nx, Ny, Nz)`` JAX array giving
+        the gradient of ``gradient_term`` along the respective axis.
     """
+    # Compute the scalar coefficient in float64 to preserve precision, then
+    # cast to the dtype of ne to avoid widening the array unnecessarily.
+    coeff = np.float64(-0.5) * float(c) ** 2 / (3.14207787e-4 * float(omega) ** 2)
+    gradient_term = ne * ne.dtype.type(coeff)
+    dndx = jnp.gradient(gradient_term, x, axis=0)
+    dndy = jnp.gradient(gradient_term, y, axis=1)
+    dndz = jnp.gradient(gradient_term, z, axis=2)
+    return dndx, dndy, dndz
 
+
+def dndr(r, dndx, dndy, dndz, x, y, z):
+    """
+    Returns the gradient of the refractive-index driving term at the ray
+    positions *r* by trilinear interpolation of the pre-computed gradient grids.
+
+    Args:
+        r (jax.Array): Shape ``(N, 3)`` — N ray positions ``[x, y, z]``.
+        dndx, dndy, dndz (jax.Array): Pre-computed gradient grids of shape
+            ``(Nx, Ny, Nz)``, produced by :func:`precompute_gradients`.
+        x, y, z (jax.Array): 1-D coordinate arrays in metres.
+
+    Returns:
+        jax.Array: Shape ``(3, N)`` — gradient components at each ray position.
+    """
     grad = jnp.zeros_like(r.T)
-
-    dndx = jnp.gradient(gradient_term, x, axis = 0)
-    grad = grad.at[0, :].set(trilinearInterpolator((x, y, z), dndx, r, fill_value = 0.0))
-    del dndx
-
-    dndy = jnp.gradient(gradient_term, y, axis = 1)
-    grad = grad.at[1, :].set(trilinearInterpolator((x, y, z), dndy, r, fill_value = 0.0))
-    del dndy
-
-    dndz = jnp.gradient(gradient_term, z, axis = 2)
-    grad = grad.at[2, :].set(trilinearInterpolator((x, y, z), dndz, r, fill_value = 0.0))
-    del dndz
-
+    grad = grad.at[0, :].set(trilinearInterpolator((x, y, z), dndx, r, fill_value=0.0))
+    grad = grad.at[1, :].set(trilinearInterpolator((x, y, z), dndy, r, fill_value=0.0))
+    grad = grad.at[2, :].set(trilinearInterpolator((x, y, z), dndz, r, fill_value=0.0))
     return grad
 
 def kappa_inv_brems(ne, Te, Z, omega):
@@ -109,9 +141,15 @@ def kappa_inv_brems(ne, Te, Z, omega):
 
 
 # ODEs of photon paths, standalone function to support the solve()
-def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims, kappa=None):
+def dsdt(t, s, parallelise, dndx, dndy, dndz, x, y, z, lengths, dims, kappa=None):
     """
-    Returns an array with the gradients and velocity per ray for ode_int
+    Returns an array with the gradients and velocity per ray for ode_int.
+
+    Accepts pre-computed gradient grids ``dndx``, ``dndy``, ``dndz`` (produced
+    by :func:`precompute_gradients`) rather than the raw electron-density array
+    and laser frequency.  Computing the spatial gradients of the driving term
+    once before the ODE loop — rather than at every adaptive time step — is the
+    primary performance optimisation for large-scale runs.
 
     When *kappa* is ``None`` the state vector has 6 elements per ray
     ``(x, y, z, vx, vy, vz)``.  When *kappa* is a 3-D JAX array (the
@@ -120,25 +158,30 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims, kappa=None):
     The amplitude ODE is ``da/dt = -kappa(r) * a`` (absorption).
 
     Args:
-        t (float array): I think this is a dummy variable for ode_int - our problem is time invarient
-        s (6N or 7N float array): flattened 6xN (or 7xN) array of rays used by ode_int
-        ScalarDomain (ScalarDomain): an ScalarDomain object which can calculate gradients
-        kappa (jax.Array or None): pre-computed inverse bremsstrahlung absorption rate
-            grid [1/s] on the same (x, y, z) coordinate grid.  Pass ``None``
-            (default) to disable inverse bremsstrahlung.
+        t (float): Dummy time variable (problem is time-invariant).
+        s (jax.Array): Flattened 6N (or 7N) state vector used by the ODE solver.
+        parallelise (bool): When ``True`` each vmap call carries a single ray;
+            the state is reshaped to ``(6, 1)`` (or ``(7, 1)``).  When ``False``
+            the serial path reshapes to ``(6, N)`` (or ``(7, N)``).
+        dndx, dndy, dndz (jax.Array): Pre-computed gradient grids of the
+            refractive-index driving term, shape ``(Nx, Ny, Nz)``.
+        x, y, z (jax.Array): 1-D coordinate arrays in metres.
+        lengths, dims (jax.Array): Domain lengths and grid dimensions (passed
+            through for legacy compatibility; not used inside this function).
+        kappa (jax.Array or None): Pre-computed inverse bremsstrahlung absorption
+            rate grid [1/s].  Pass ``None`` (default) to disable inverse
+            bremsstrahlung.
 
     Returns:
-        6N or 7N float array: flattened array for ode_int
+        jax.Array: Flattened 6N (or 7N) derivative array.
     """
 
     nstate = 7 if kappa is not None else 6
 
     if not parallelise:
-        print("False")
         # jnp.reshape() auto converts to a jax array rather than having to do after a numpy reshape
         s = jnp.reshape(s, (nstate, s.size // nstate))
     else:
-        print("True")
         # forces s to be a matrix even if has the indexes of a 1d array such that dsdt() can be generalised
         s = jnp.reshape(s, (nstate, 1))  # one ray per vmap iteration if parallelised
 
@@ -153,26 +196,17 @@ def dsdt(t, s, parallelise, ne, x, y, z, omega, lengths, dims, kappa=None):
     if kappa is not None:
         a = s[6, :]
 
-    # was deleting before it needed using before by accident - obviously caused issues (AbstractTerm error)
-    # - fine to delete after used, only one slice of s0 rather than deleting s0
-    # although probably really unnecessary?
     del s
-
-    gradient_term = -0.5 * c ** 2 * ne / (3.14207787e-4 * omega ** 2)
 
     # must unpack x, y, z tuple here for the sake of dndr, could be earlier but this is easier to pass and more generalised
     # r must be transposed within dndr(...) else we get an AbstractTerm error due to the effect on the return value
-    sprime = sprime.at[3:6, :].set(dndr(r, gradient_term, omega, x, y, z))
+    sprime = sprime.at[3:6, :].set(dndr(r, dndx, dndy, dndz, x, y, z))
     sprime = sprime.at[:3, :].set(v)
 
     # Inverse bremsstrahlung amplitude attenuation: da/dt = -kappa(r) * a
     if kappa is not None:
         kappa_at_r = trilinearInterpolator((x, y, z), kappa, r, fill_value=0.0)
         sprime = sprime.at[6, :].set(-kappa_at_r * a)
-
-    ###
-    ### Sort out passed functions and objects
-    ###
 
     # Keep derivative shape consistent with solver state shape (flattened 1D state vector).
     return jnp.ravel(sprime)
@@ -568,11 +602,19 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                     omega,
                 )
 
-            args = (
-                parallelise, 
+            # Pre-compute gradient grids once here so the ODE body only does
+            # trilinear interpolation at each adaptive step, not full-grid
+            # jnp.gradient calls.
+            dndx, dndy, dndz = precompute_gradients(
                 ScalarDomain.ne,
                 ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
-                omega, 
+                omega,
+            )
+
+            args = (
+                parallelise,
+                dndx, dndy, dndz,
+                ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
                 ScalarDomain.lengths, ScalarDomain.dims,
                 kappa_grid,
             )
@@ -1070,11 +1112,19 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
 
     Np = s0.shape[1]
 
-    args = (
-        True,  # parallelise=True (each vmap'd call handles one ray)
+    # Pre-compute gradient grids once here so the ODE body only does
+    # trilinear interpolation at each adaptive step, not full-grid
+    # jnp.gradient calls.
+    dndx, dndy, dndz = precompute_gradients(
         ScalarDomain.ne,
         ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
         omega,
+    )
+
+    args = (
+        True,  # parallelise=True (each vmap'd call handles one ray)
+        dndx, dndy, dndz,
+        ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
         ScalarDomain.lengths, ScalarDomain.dims,
         kappa,
     )

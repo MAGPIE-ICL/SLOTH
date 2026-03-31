@@ -1,4 +1,4 @@
-name: CI – depth-save physics tests
+name: CI – physics and benchmark tests
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Run depth-save tests (Python ${{ matrix.python-version }})
+    name: Run tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,3 +37,15 @@ jobs:
           PYTHONPATH: src
         run: |
           python -m pytest tests/test_depth_saves.py -v --tb=short
+
+      - name: Run inverse bremsstrahlung tests
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pytest tests/test_inv_brems.py -v --tb=short
+
+      - name: Run quadratic trough benchmark (analytic correctness + timing)
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pytest tests/test_quadratic_trough.py -v --tb=short -s
