@@ -190,13 +190,13 @@ class ScalarDomain:
         """
         self.Te = np.maximum(Te_min,Te)
 
-    def external_Z(self, Z):
+    def external_Z(self, Zbar):
         """Load externally generated grid
 
         Args:
-            Z ([type]): MxMxM grid of ionisation
+            Zbar ([type]): MxMxM grid of ionisation
         """
-        self.Z = Z
+        self.Zbar = Zbar
         
     def test_B(self, Bmax=1.0):
         """A Bz field with a linear gradient in x:
@@ -248,24 +248,24 @@ class ScalarDomain:
 
             return 4.19e5*np.sqrt(Te)
 
-        def V(ne, Te, Z, omega):
+        def V(ne, Te, Zbar, omega):
             o_pe  = self.omega_pe(ne)
             o_max = np.copy(o_pe)
             o_max[o_pe < omega] = omega
-            L_classical = Z*sc.e/Te
+            L_classical = Zbar*sc.e/Te
             L_quantum = 2.760428269727312e-10/np.sqrt(Te) # sc.hbar/np.sqrt(sc.m_e*sc.e*Te)
             L_max = np.maximum(L_classical, L_quantum)
 
             return o_max*L_max
 
-        def coloumbLog(ne, Te, Z, omega):
-            return np.maximum(2.0,np.log(v_the(Te)/V(ne, Te, Z, omega)))
+        def coloumbLog(ne, Te, Zbar, omega):
+            return np.maximum(2.0,np.log(v_the(Te)/V(ne, Te, Zbar, omega)))
 
         ne_cc = self.ne*1e-6
         o_pe = self.omega_pe(ne_cc)
-        CL = coloumbLog(ne_cc, self.Te, self.Z, self.omega)
+        CL = coloumbLog(ne_cc, self.Te, self.Zbar, self.omega)
 
-        return 3.1e-5*self.Z*c*np.power(ne_cc/self.omega,2)*CL*np.power(self.Te, -1.5) # 1/s
+        return 3.1e-5*self.Zbar*c*np.power(ne_cc/self.omega,2)*CL*np.power(self.Te, -1.5) # 1/s
 
     # Plasma refractive index
     def n_refrac(self):

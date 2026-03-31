@@ -10,7 +10,7 @@ Physics checks:
   3. Monotonic decay: amplitude decreases (or stays equal) at every successive
      depth save in a uniform plasma.
   4. Density scaling: a denser plasma produces stronger attenuation
-     (lower final amplitude) than a dilute plasma with the same Te and Z.
+     (lower final amplitude) than a dilute plasma with the same Te and Zbar.
 """
 
 import os
@@ -43,7 +43,7 @@ class _MinimalDomain:
     """Lightweight stand-in for core.domain.ScalarDomain."""
 
     def __init__(self, ne, x, y, z, probing_direction='z',
-                 inv_brems=False, Te=None, Z=None):
+                 inv_brems=False, Te=None, Zbar=None):
         self.ne = jnp.array(ne, dtype=jnp.float32)
         self.x  = jnp.array(x,  dtype=jnp.float32)
         self.y  = jnp.array(y,  dtype=jnp.float32)
@@ -60,7 +60,7 @@ class _MinimalDomain:
             self.Te = jnp.asarray(Te, dtype=jnp.float32)
         else:
             self.Te = None
-        self.Z = jnp.asarray(Z, dtype=jnp.float32) if Z is not None else None
+        self.Zbar = jnp.asarray(Zbar, dtype=jnp.float32) if Zbar is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -77,18 +77,18 @@ def _vacuum_domain_ib(half_size=_HALF, n=_N):
     ne     = np.zeros((n, n, n), dtype=np.float32)
     return _MinimalDomain(
         ne, coords, coords, coords, probing_direction='z',
-        inv_brems=True, Te=100.0, Z=1.0,
+        inv_brems=True, Te=100.0, Zbar=1.0,
     )
 
 
-def _uniform_plasma_domain(ne_val, Te_val=100.0, Z_val=1.0,
+def _uniform_plasma_domain(ne_val, Te_val=100.0, Zbar_val=1.0,
                             half_size=_HALF, n=_N):
     """Uniform-density domain with inv_brems enabled."""
     coords = np.linspace(-half_size, half_size, n)
     ne     = np.full((n, n, n), ne_val, dtype=np.float32)
     return _MinimalDomain(
         ne, coords, coords, coords, probing_direction='z',
-        inv_brems=True, Te=float(Te_val), Z=float(Z_val),
+        inv_brems=True, Te=float(Te_val), Zbar=float(Zbar_val),
     )
 
 
@@ -114,7 +114,7 @@ def _collimated_rays(Np=20, beam_radius=3e-4, z_start=-_HALF):
 # ---------------------------------------------------------------------------
 
 class TestVacuumAmplitude:
-    """With ne=0 the amplitude must remain 1 regardless of Te/Z."""
+    """With ne=0 the amplitude must remain 1 regardless of Te/Zbar."""
 
     def test_amplitude_is_one_in_vacuum(self):
         domain = _vacuum_domain_ib()
@@ -140,14 +140,14 @@ class TestAnalyticalAmplitude:
     """
     For a uniform plasma the amplitude must match the analytical formula:
         a(L) = exp(-κ · L / c)
-    where κ = kappa_inv_brems(ne, Te, Z, omega).
+    where κ = kappa_inv_brems(ne, Te, Zbar, omega).
     """
 
     # Parameters chosen to give ≈10 % amplitude loss over 2 mm — clearly
     # measurable while remaining in the physically valid regime.
     NE_VAL  = 1e25   # m^-3
     TE_VAL  = 100.0  # eV
-    Z_VAL   = 1.0
+    Zbar_VAL   = 1.0
     LWL     = 1064e-9
     DEPTH   = 2e-3   # m   (must fit inside domain)
     HALF    = 3e-3   # domain half-size (m) — larger than DEPTH/2
@@ -158,14 +158,14 @@ class TestAnalyticalAmplitude:
         kappa = float(kappa_inv_brems(
             jnp.float32(self.NE_VAL),
             jnp.float32(self.TE_VAL),
-            self.Z_VAL,
+            self.Zbar_VAL,
             omega,
         ))
         return np.exp(-kappa * depth / c)
 
     def test_final_amplitude_matches_analytic(self):
         domain = _uniform_plasma_domain(
-            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            self.NE_VAL, Te_val=self.TE_VAL, Zbar_val=self.Zbar_VAL,
             half_size=self.HALF, n=24,
         )
         s0 = _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
@@ -195,7 +195,7 @@ class TestAnalyticalAmplitude:
     def test_amplitude_at_intermediate_depths(self):
         """Amplitude at each saved depth must match the analytic formula."""
         domain = _uniform_plasma_domain(
-            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            self.NE_VAL, Te_val=self.TE_VAL, Zbar_val=self.Zbar_VAL,
             half_size=self.HALF, n=24,
         )
         s0 = _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
@@ -303,13 +303,13 @@ class TestWeightedJvec:
 
     NE_VAL = 1e25
     TE_VAL = 100.0
-    Z_VAL  = 1.0
+    Zbar_VAL  = 1.0
     LWL    = 1064e-9
     HALF   = 3e-3
 
     def _run(self):
         domain = _uniform_plasma_domain(
-            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            self.NE_VAL, Te_val=self.TE_VAL, Zbar_val=self.Zbar_VAL,
             half_size=self.HALF, n=20,
         )
         s0 = _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
@@ -364,54 +364,54 @@ class TestWeightedJvec:
             )
 
 
-class TestArrayZ:
-    """Z charge state can be a spatially varying array, not just a scalar."""
+class TestArrayZbar:
+    """Zbar charge state can be a spatially varying array, not just a scalar."""
 
     NE_VAL  = 1e25
     TE_VAL  = 100.0
-    Z_VAL   = 1.0
+    Zbar_VAL   = 1.0
     LWL     = 1064e-9
     DEPTH   = 2e-3
     HALF    = 3e-3
 
-    def _domain_with_scalar_z(self, n=20):
+    def _domain_with_scalar_zbar(self, n=20):
         coords = np.linspace(-self.HALF, self.HALF, n)
         ne     = np.full((n, n, n), self.NE_VAL, dtype=np.float32)
         return _MinimalDomain(
             ne, coords, coords, coords, probing_direction='z',
-            inv_brems=True, Te=self.TE_VAL, Z=self.Z_VAL,
+            inv_brems=True, Te=self.TE_VAL, Zbar=self.Zbar_VAL,
         )
 
-    def _domain_with_uniform_array_z(self, n=20):
-        """Z supplied as a 3-D array filled with the same scalar value."""
+    def _domain_with_uniform_array_zbar(self, n=20):
+        """Zbar supplied as a 3-D array filled with the same scalar value."""
         coords = np.linspace(-self.HALF, self.HALF, n)
         ne     = np.full((n, n, n), self.NE_VAL, dtype=np.float32)
-        Z_arr  = np.full((n, n, n), self.Z_VAL, dtype=np.float32)
+        Zbar_arr  = np.full((n, n, n), self.Zbar_VAL, dtype=np.float32)
         return _MinimalDomain(
             ne, coords, coords, coords, probing_direction='z',
-            inv_brems=True, Te=self.TE_VAL, Z=Z_arr,
+            inv_brems=True, Te=self.TE_VAL, Zbar=Zbar_arr,
         )
 
     def test_array_z_stored_as_array(self):
-        """When Z is provided as a 3-D array it must be stored as a JAX array with correct values."""
-        domain = self._domain_with_uniform_array_z()
-        assert hasattr(domain.Z, 'shape'), "Z should be a JAX array with a .shape attribute"
-        assert domain.Z.shape == (20, 20, 20), f"Unexpected Z shape: {domain.Z.shape}"
+        """When Zbar is provided as a 3-D array it must be stored as a JAX array with correct values."""
+        domain = self._domain_with_uniform_array_zbar()
+        assert hasattr(domain.Zbar, 'shape'), "Zbar should be a JAX array with a .shape attribute"
+        assert domain.Zbar.shape == (20, 20, 20), f"Unexpected Zbar shape: {domain.Zbar.shape}"
         np.testing.assert_allclose(
-            np.asarray(domain.Z), self.Z_VAL, rtol=1e-6,
-            err_msg="Array Z values should all equal Z_VAL",
+            np.asarray(domain.Zbar), self.Zbar_VAL, rtol=1e-6,
+            err_msg="Array Zbar values should all equal Zbar_VAL",
         )
 
     def test_scalar_z_stored_as_array(self):
-        """When Z is provided as a scalar it must also be stored as a JAX array with the correct value."""
-        domain = self._domain_with_scalar_z()
-        assert hasattr(domain.Z, 'shape'), "Z should be a JAX array with a .shape attribute"
-        assert float(domain.Z) == self.Z_VAL, (
-            f"Scalar Z value {float(domain.Z)} should equal Z_VAL {self.Z_VAL}"
+        """When Zbar is provided as a scalar it must also be stored as a JAX array with the correct value."""
+        domain = self._domain_with_scalar_zbar()
+        assert hasattr(domain.Zbar, 'shape'), "Zbar should be a JAX array with a .shape attribute"
+        assert float(domain.Zbar) == self.Zbar_VAL, (
+            f"Scalar Zbar value {float(domain.Zbar)} should equal Zbar_VAL {self.Zbar_VAL}"
         )
 
-    def test_uniform_array_z_matches_scalar_z(self):
-        """A uniform array Z must produce the same final amplitude as the equivalent scalar Z."""
+    def test_uniform_array_zbar_matches_scalar_zbar(self):
+        """A uniform array Zbar must produce the same final amplitude as the equivalent scalar Zbar."""
         s0 = _collimated_rays(Np=12, beam_radius=2e-4, z_start=-self.HALF)
 
         def _run(domain):
@@ -423,32 +423,32 @@ class TestArrayZ:
             )
             return float(np.asarray(result['amplitude'][-1]).mean())
 
-        amp_scalar = _run(self._domain_with_scalar_z())
-        amp_array  = _run(self._domain_with_uniform_array_z())
+        amp_scalar = _run(self._domain_with_scalar_zbar())
+        amp_array  = _run(self._domain_with_uniform_array_zbar())
 
         np.testing.assert_allclose(
             amp_array, amp_scalar, rtol=1e-5,
             err_msg=(
-                f"Uniform array Z ({amp_array:.8f}) should match scalar Z ({amp_scalar:.8f})"
+                f"Uniform array Zbar ({amp_array:.8f}) should match scalar Zbar ({amp_scalar:.8f})"
             ),
         )
 
     def test_varying_z_changes_absorption(self):
-        """A higher Z in the beam path must produce more absorption than Z=1."""
+        """A higher Zbar in the beam path must produce more absorption than Zbar=1."""
         n      = 20
         coords = np.linspace(-self.HALF, self.HALF, n)
         ne     = np.full((n, n, n), self.NE_VAL, dtype=np.float32)
 
-        # Z=1 everywhere (low absorption)
+        # Zbar=1 everywhere (low absorption)
         domain_low_z = _MinimalDomain(
             ne, coords, coords, coords, probing_direction='z',
-            inv_brems=True, Te=self.TE_VAL, Z=1.0,
+            inv_brems=True, Te=self.TE_VAL, Zbar=1.0,
         )
 
-        # Z=4 everywhere (high absorption)
+        # Zbar=4 everywhere (high absorption)
         domain_high_z = _MinimalDomain(
             ne, coords, coords, coords, probing_direction='z',
-            inv_brems=True, Te=self.TE_VAL, Z=4.0,
+            inv_brems=True, Te=self.TE_VAL, Zbar=4.0,
         )
 
         s0 = _collimated_rays(Np=12, beam_radius=2e-4, z_start=-self.HALF)
@@ -466,6 +466,6 @@ class TestArrayZ:
         amp_high = _run(domain_high_z)
 
         assert amp_high < amp_low, (
-            f"Expected higher Z to give lower amplitude: Z=4 gave {amp_high:.6f}, "
-            f"Z=1 gave {amp_low:.6f}"
+            f"Expected higher Zbar to give lower amplitude: Zbar=4 gave {amp_high:.6f}, "
+            f"Zbar=1 gave {amp_low:.6f}"
         )

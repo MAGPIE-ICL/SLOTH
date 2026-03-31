@@ -63,7 +63,7 @@ def dndr(r, gradient_term, omega, x, y, z):
 
     return grad
 
-def kappa_inv_brems(ne, Te, Z, omega):
+def kappa_inv_brems(ne, Te, Zbar, omega):
     """
     Compute the inverse bremsstrahlung amplitude absorption rate [1/s] at each
     grid point using the NRL formulary (NRL Plasma Formulary, p.58).
@@ -77,7 +77,7 @@ def kappa_inv_brems(ne, Te, Z, omega):
         ne  (jax.Array or float): Electron density in m\ :sup:`-3`.
         Te  (jax.Array or float): Electron temperature in eV.  May be a scalar
             (uniform temperature) or a 3-D array with the same shape as *ne*.
-        Z   (jax.Array or float): Mean ion charge state (dimensionless).  May be a scalar
+        Zbar (jax.Array or float): Mean ion charge state (dimensionless).  May be a scalar
             (uniform charge state) or a 3-D array with the same shape as *ne*.
         omega (float): Laser angular frequency in rad/s.
 
@@ -98,14 +98,14 @@ def kappa_inv_brems(ne, Te, Z, omega):
     o_max = jnp.maximum(o_pe, omega)
 
     # Classical and quantum minimum impact parameters
-    L_classical = Z * e_charge / Te                          # Z * e [C] / Te [eV] = Z * e / (Te * e) [m] → metres
+    L_classical = Zbar * e_charge / Te                          # Zbar * e [C] / Te [eV] = Zbar * e / (Te * e) [m] → metres
     L_quantum   = 2.760428269727312e-10 / jnp.sqrt(Te)      # hbar/sqrt(m_e * e) / sqrt(Te[eV]) [m]; constant = hbar/sqrt(m_e*e) in SI
     L_max       = jnp.maximum(L_classical, L_quantum)
 
     # Coulomb logarithm (clamped to ≥ 2)
     CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * L_max)))
 
-    return 3.1e-5 * Z * c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
+    return 3.1e-5 * Zbar * c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
 
 
 # ODEs of photon paths, standalone function to support the solve()
@@ -564,7 +564,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                 kappa_grid = kappa_inv_brems(
                     ScalarDomain.ne,
                     ScalarDomain.Te,
-                    ScalarDomain.Z,
+                    ScalarDomain.Zbar,
                     omega,
                 )
 
@@ -1052,7 +1052,7 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
         kappa = kappa_inv_brems(
             ScalarDomain.ne,
             ScalarDomain.Te,
-            ScalarDomain.Z,
+            ScalarDomain.Zbar,
             omega,
         )
 
