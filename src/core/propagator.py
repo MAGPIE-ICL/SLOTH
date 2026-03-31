@@ -118,11 +118,11 @@ def kappa_inv_brems(ne, Te, Z, omega):
         jax.Array: Amplitude absorption rate with the same shape as *ne*, units of 1/s.
 
     Note:
-        The Coulomb logarithm uses the correct classical minimum impact
-        parameter ``b_classical = Z·e / (4πε₀·Tₑ[eV])`` [m].  For cold
-        plasmas or high-Z ions (Tₑ < ~27·Z² eV) this dominates over the
-        quantum parameter and reduces the Coulomb log relative to the
-        quantum-only limit.
+        The Coulomb logarithm uses the classical minimum impact parameter
+        ``b_min = Z·e / (4πε₀·Tₑ[eV])`` [m] throughout.  This is the
+        simplest NRL formulation and matches the legacy full_solver behaviour.
+        The density must be in m\ :sup:`-3`, temperature in eV, and Z is the
+        mean ion charge state.
     """
     from scipy.constants import e as e_charge, epsilon_0
 
@@ -137,15 +137,11 @@ def kappa_inv_brems(ne, Te, Z, omega):
     # Upper limit for Coulomb logarithm argument: max(omega_pe, omega)
     o_max = jnp.maximum(o_pe, omega)
 
-    # Classical and quantum minimum impact parameters.
-    # b_classical = Z e² / (4πε₀ k_B T_e) = Z e / (4πε₀ T_e[eV])  [m]
-    # b_quantum   = ħ / (m_e v_th) = 2.76e-10 / sqrt(T_e[eV])      [m]
-    L_classical = Z * e_charge / (4.0 * np.pi * epsilon_0 * Te)  # classical minimum impact parameter [m]
-    L_quantum   = 2.760428269727312e-10 / jnp.sqrt(Te)           # quantum minimum impact parameter [m]
-    L_max       = jnp.maximum(L_classical, L_quantum)
+    # Classical minimum impact parameter: b_min = Z·e / (4πε₀·T_e[eV])  [m]
+    b_min = Z * e_charge / (4.0 * np.pi * epsilon_0 * Te)
 
     # Coulomb logarithm (clamped to ≥ 2)
-    CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * L_max)))
+    CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * b_min)))
 
     return 3.1e-5 * Z * c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
 

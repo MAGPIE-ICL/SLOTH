@@ -660,13 +660,12 @@ class TestWavelengthScaling:
         ne_cc  = ne_val * 1e-6
 
         def _coulomb_log(omega):
-            """Reference CL using the correct b_classical."""
+            """Reference CL using classical b_min = Z·e/(4πε₀·Te)."""
             v_the = 4.19e5 * np.sqrt(Te_eV)
             o_pe  = 5.64e4 * np.sqrt(ne_cc)
             o_max = max(o_pe, omega)
-            b_c   = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
-            b_q   = 2.760428269727312e-10 / np.sqrt(Te_eV)
-            return max(2.0, np.log(v_the / (o_max * max(b_c, b_q))))
+            b_min = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
+            return max(2.0, np.log(v_the / (o_max * b_min)))
 
         omega_351  = 2 * np.pi * c / 351e-9
         omega_1064 = 2 * np.pi * c / 1064e-9
@@ -774,46 +773,37 @@ class TestNpScaling:
 
 class TestCoulombLogClassicalRegime:
     """
-    When the classical minimum impact parameter
-        b_classical = Z·e / (4πε₀·Tₑ[eV])   [m]
-    exceeds the quantum one
-        b_quantum   = 2.76e-10 / √Tₑ[eV]     [m],
-    the Coulomb logarithm must use b_classical as b_min.
-
-    This happens for cold plasmas (Tₑ < ~27 Z² eV).  The original buggy code
-    used  b_classical = Z·e / Tₑ  (missing 1/(4πε₀)), so b_classical was ~9×10⁹
-    times too small and the quantum term always dominated — overestimating the
+    The Coulomb logarithm uses the classical minimum impact parameter
+        b_min = Z·e / (4πε₀·Tₑ[eV])   [m]
+    throughout.  The original buggy code used  b_min = Z·e / Tₑ  (missing
+    1/(4πε₀)), so b_min was ~9×10⁹ times too small, overestimating the
     Coulomb logarithm and therefore kappa.
 
-    These tests verify that kappa_inv_brems returns the value consistent with the
-    correct Coulomb log in both the classical and quantum regimes.
+    These tests verify that kappa_inv_brems returns the value consistent with
+    the correct b_min = Z·e/(4πε₀·Tₑ) formula.
     """
 
     @staticmethod
     def _reference_kappa(ne_val, Te_eV, Z_val, omega):
-        """Compute the expected kappa using the correct physics formulae."""
+        """Compute the expected kappa using the classical b_min formula."""
         from scipy.constants import e as e_charge, epsilon_0 as eps0
         ne_cc = ne_val * 1e-6
         v_the = 4.19e5 * np.sqrt(Te_eV)
         o_pe  = 5.64e4 * np.sqrt(ne_cc)
         o_max = max(o_pe, omega)
-        # correct classical minimum impact parameter
-        b_classical = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
-        b_quantum   = 2.760428269727312e-10 / np.sqrt(Te_eV)
-        b_min       = max(b_classical, b_quantum)
+        b_min = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
         CL = max(2.0, np.log(v_the / (o_max * b_min)))
         return 3.1e-5 * Z_val * c * (ne_cc / omega) ** 2 * CL * Te_eV ** (-1.5)
 
-    # (Te_eV, Z_val) pairs — classical regime (b_classical > b_quantum) marked *
     @pytest.mark.parametrize("Te_eV, Z_val", [
-        (100.0, 1.0),   # quantum regime  (Te = 100 eV > 27·1² = 27 eV)
-        (5.0,   1.0),   # classical regime*  (Te = 5 eV < 27 eV)
-        (10.0,  1.0),   # classical regime*  (Te = 10 eV < 27 eV)
-        (100.0, 4.0),   # classical regime*  (Te = 100 eV < 27·4² = 432 eV)
-        (200.0, 6.0),   # classical regime*  (Te = 200 eV < 27·6² = 972 eV)
+        (100.0, 1.0),
+        (5.0,   1.0),
+        (10.0,  1.0),
+        (100.0, 4.0),
+        (200.0, 6.0),
     ])
     def test_kappa_matches_correct_coulomb_log(self, Te_eV, Z_val):
-        """kappa_inv_brems must agree with the reference (correct b_min) formula."""
+        """kappa_inv_brems must agree with the classical b_min reference formula."""
         ne_val = 1e25   # m^-3 — underdense
         omega  = 2 * np.pi * c / 1064e-9
 
@@ -826,44 +816,35 @@ class TestCoulombLogClassicalRegime:
             err_msg=(
                 f"Te={Te_eV} eV, Z={Z_val}: kappa={kappa_got:.6g}, "
                 f"expected={kappa_ref:.6g}. "
-                f"Check that b_classical = Ze/(4πε₀·Te) is used when it exceeds b_quantum."
+                f"Check that b_min = Ze/(4πε₀·Te) is used."
             ),
         )
 
-    def test_classical_regime_gives_lower_kappa_than_buggy(self):
+    def test_correct_b_min_gives_lower_kappa_than_buggy(self):
         """
-        In the classical regime (b_classical > b_quantum), using the correct
-        b_classical (larger) increases b_min and therefore REDUCES the Coulomb log
-        and kappa relative to the buggy implementation that always used b_quantum.
-
-        This verifies the direction of the fix: the corrected kappa must be
-        ≤ the buggy kappa in the classical-dominated regime.
+        The correct b_min = Z·e/(4πε₀·Te) is much larger than the buggy
+        b_min = Z·e/Te (missing 1/(4πε₀)), so the correct Coulomb log is
+        smaller, giving lower kappa.
         """
         from scipy.constants import e as e_charge, epsilon_0 as eps0
-        # Cold plasma, Z=4: clearly in classical regime
         Te_eV  = 10.0
         Z_val  = 4.0
         ne_val = 1e25
         omega  = 2 * np.pi * c / 1064e-9
 
-        # Compute CL with correct b_classical
         ne_cc = ne_val * 1e-6
         v_the = 4.19e5 * np.sqrt(Te_eV)
         o_pe  = 5.64e4 * np.sqrt(ne_cc)
         o_max = max(o_pe, omega)
-        b_classical_correct = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
-        b_classical_buggy   = Z_val * e_charge / Te_eV       # missing 1/(4πε₀)
-        b_quantum           = 2.760428269727312e-10 / np.sqrt(Te_eV)
+        b_min_correct = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
+        b_min_buggy   = Z_val * e_charge / Te_eV       # missing 1/(4πε₀)
 
-        CL_correct = max(2.0, np.log(v_the / (o_max * max(b_classical_correct, b_quantum))))
-        CL_buggy   = max(2.0, np.log(v_the / (o_max * max(b_classical_buggy,   b_quantum))))
+        CL_correct = max(2.0, np.log(v_the / (o_max * b_min_correct)))
+        CL_buggy   = max(2.0, np.log(v_the / (o_max * b_min_buggy)))
 
-        assert b_classical_correct > b_quantum, (
-            "Test setup error: b_classical_correct should exceed b_quantum here."
-        )
         assert CL_correct < CL_buggy, (
             f"CL_correct ({CL_correct:.4f}) should be < CL_buggy ({CL_buggy:.4f}) "
-            f"because larger b_min → smaller argument of log."
+            f"because correct b_min is larger."
         )
 
         # The actual kappa_inv_brems must match the corrected value
