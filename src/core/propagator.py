@@ -57,7 +57,11 @@ def precompute_gradients(ne, x, y, z, omega):
     remains well within float32 range for any sub-critical plasma.
 
     Args:
-        ne    (jax.Array): Electron density grid in m⁻³, shape ``(Nx, Ny, Nz)``.
+        ne    (jax.Array): Electron density grid **in m⁻³**, shape ``(Nx, Ny, Nz)``.
+            If your density is in cm⁻³ convert with ``ne_m3 = ne_cc * 1e6`` before
+            passing.  Cells with ``ne ≥ ncr`` (critical density) are physically
+            evanescent; the function warns if any such cells are present, as this
+            causes large gradient magnitudes that can prevent the ODE from converging.
         x, y, z (jax.Array): 1-D coordinate arrays in metres.
         omega (float): Laser angular frequency in rad/s.
 
@@ -65,6 +69,20 @@ def precompute_gradients(ne, x, y, z, omega):
         tuple: ``(dndx, dndy, dndz)`` — each a ``(Nx, Ny, Nz)`` JAX array giving
         the gradient of ``gradient_term`` along the respective axis.
     """
+    # Critical density for this laser frequency [m^-3]: ncr = me*eps0*omega^2/e^2
+    ncr = 3.14207787e-4 * float(omega) ** 2
+    ne_max = float(jnp.max(ne))
+    if ne_max >= ncr:
+        import warnings
+        warnings.warn(
+            f"precompute_gradients: {ne_max:.3g} m⁻³ cells at or above critical "
+            f"density ncr = {ncr:.3g} m⁻³ (ne/ncr = {ne_max/ncr:.2g}).  "
+            "This causes large gradient magnitudes that prevent ODE convergence.  "
+            "Check that ne is in m⁻³ (not cm⁻³ — convert with ne_cc * 1e6) and "
+            "that your domain does not include over-critical cells.",
+            stacklevel=2,
+        )
+
     # Compute the scalar coefficient in float64 to preserve precision, then
     # cast to the dtype of ne to avoid widening the array unnecessarily.
     coeff = np.float64(-0.5) * float(c) ** 2 / (3.14207787e-4 * float(omega) ** 2)
@@ -118,11 +136,11 @@ def kappa_inv_brems(ne, Te, Z, omega):
         jax.Array: Amplitude absorption rate with the same shape as *ne*, units of 1/s.
 
     Note:
-        The Coulomb logarithm uses the correct classical minimum impact
-        parameter ``b_classical = Z·e / (4πε₀·Tₑ[eV])`` [m].  For cold
-        plasmas or high-Z ions (Tₑ < ~27·Z² eV) this dominates over the
-        quantum parameter and reduces the Coulomb log relative to the
-        quantum-only limit.
+        The Coulomb logarithm uses the classical minimum impact parameter
+        ``b_min = Z·e / (4πε₀·Tₑ[eV])`` [m] throughout.  This is the
+        simplest NRL formulation and matches the legacy full_solver behaviour.
+        The density must be in m\ :sup:`-3`, temperature in eV, and Z is the
+        mean ion charge state.
     """
     from scipy.constants import e as e_charge, epsilon_0
 
@@ -137,15 +155,11 @@ def kappa_inv_brems(ne, Te, Z, omega):
     # Upper limit for Coulomb logarithm argument: max(omega_pe, omega)
     o_max = jnp.maximum(o_pe, omega)
 
-    # Classical and quantum minimum impact parameters.
-    # b_classical = Z e² / (4πε₀ k_B T_e) = Z e / (4πε₀ T_e[eV])  [m]
-    # b_quantum   = ħ / (m_e v_th) = 2.76e-10 / sqrt(T_e[eV])      [m]
-    L_classical = Z * e_charge / (4.0 * np.pi * epsilon_0 * Te)  # classical minimum impact parameter [m]
-    L_quantum   = 2.760428269727312e-10 / jnp.sqrt(Te)           # quantum minimum impact parameter [m]
-    L_max       = jnp.maximum(L_classical, L_quantum)
+    # Classical minimum impact parameter: b_min = Z·e / (4πε₀·T_e[eV])  [m]
+    b_min = Z * e_charge / (4.0 * np.pi * epsilon_0 * Te)
 
     # Coulomb logarithm (clamped to ≥ 2)
-    CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * L_max)))
+    CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * b_min)))
 
     return 3.1e-5 * Z * c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
 
@@ -164,8 +178,15 @@ def dsdt(t, s, parallelise, dndx, dndy, dndz, x, y, z, lengths, dims, kappa=None
     When *kappa* is ``None`` the state vector has 6 elements per ray
     ``(x, y, z, vx, vy, vz)``.  When *kappa* is a 3-D JAX array (the
     pre-computed inverse bremsstrahlung absorption rate) the state vector has 7
-    elements per ray, with the 7th element being the local ray amplitude *a*.
-    The amplitude ODE is ``da/dt = -kappa(r) * a`` (absorption).
+    elements per ray, with the 7th element being the accumulated **optical depth**
+    ``τ = ∫κ dt``.  The ODE is ``dτ/dt = κ(r)`` — a non-stiff, purely
+    positive accumulation.  Amplitude is recovered at output as ``a = exp(-τ)``.
+
+    Tracking τ rather than amplitude directly avoids the stiffness that the
+    equivalent amplitude ODE ``da/dt = -κ·a`` would introduce: that equation has
+    eigenvalue ``-κ``, forcing an explicit solver (Tsit5/RK45) to take step
+    sizes ``Δt ≲ C/κ_norm``.  For realistic FLASH plasmas this can be
+    ``~10¹¹–10¹⁴ s⁻¹``, leading to millions of tiny steps or a solver hang.
 
     Args:
         t (float): Dummy time variable (problem is time-invariant).
@@ -180,7 +201,8 @@ def dsdt(t, s, parallelise, dndx, dndy, dndz, x, y, z, lengths, dims, kappa=None
             through for legacy compatibility; not used inside this function).
         kappa (jax.Array or None): Pre-computed inverse bremsstrahlung absorption
             rate grid [1/s].  Pass ``None`` (default) to disable inverse
-            bremsstrahlung.
+            bremsstrahlung.  When provided, state element 6 is the accumulated
+            optical depth ``τ`` (initialised to 0); amplitude is ``exp(-τ)``.
 
     Returns:
         jax.Array: Flattened 6N (or 7N) derivative array.
@@ -202,10 +224,6 @@ def dsdt(t, s, parallelise, dndx, dndy, dndz, x, y, z, lengths, dims, kappa=None
     r = s[:3, :].T  # transposed so it is of the correct shape for interpolators
     v = s[3:6, :]
 
-    # Extract amplitude before deleting s (only relevant when kappa is provided)
-    if kappa is not None:
-        a = s[6, :]
-
     del s
 
     # must unpack x, y, z tuple here for the sake of dndr, could be earlier but this is easier to pass and more generalised
@@ -213,10 +231,13 @@ def dsdt(t, s, parallelise, dndx, dndy, dndz, x, y, z, lengths, dims, kappa=None
     sprime = sprime.at[3:6, :].set(dndr(r, dndx, dndy, dndz, x, y, z))
     sprime = sprime.at[:3, :].set(v)
 
-    # Inverse bremsstrahlung amplitude attenuation: da/dt = -kappa(r) * a
+    # Inverse bremsstrahlung: accumulate optical depth τ.  dτ/dt = κ(r).
+    # This is non-stiff (κ ≥ 0, no exponential feedback), unlike the
+    # equivalent amplitude ODE da/dt = -κ·a which has eigenvalue -κ and
+    # forces tiny step sizes for large κ.  Amplitude is recovered as exp(-τ).
     if kappa is not None:
         kappa_at_r = trilinearInterpolator((x, y, z), kappa, r, fill_value=0.0)
-        sprime = sprime.at[6, :].set(-kappa_at_r * a)
+        sprime = sprime.at[6, :].set(kappa_at_r)
 
     # Keep derivative shape consistent with solver state shape (flattened 1D state vector).
     return jnp.ravel(sprime)
@@ -301,7 +322,7 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
                                         probing_direction=probing_direction)
 
         if inv_brems and rf_state.shape[0] == 7:
-            amp = np.asarray(rf_state[6, :])              # (N,) per-ray amplitude
+            amp = np.asarray(np.exp(-rf_state[6, :]))     # a = exp(-τ)
             rf_weighted = np.asarray(rf_geo) * amp[np.newaxis, :]
             return rf_weighted, np.asarray(rf_geo), duration
         return rf_geo, None, duration
@@ -660,10 +681,11 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
                 if i == 1:
                     s0_transformed = s0_import.T
-                    # When inv_brems is enabled, append an amplitude column (1.0)
+                    # When inv_brems is enabled, append an optical-depth column (0.0).
+                    # State[6] accumulates τ = ∫κ dt; amplitude is recovered as exp(-τ).
                     if inv_brems:
-                        amplitude_init = jnp.ones((Np, 1), dtype=s0_import.dtype)
-                        s0_transformed = jnp.concatenate([s0_transformed, amplitude_init], axis=1)
+                        tau_init = jnp.zeros((Np, 1), dtype=s0_import.dtype)
+                        s0_transformed = jnp.concatenate([s0_transformed, tau_init], axis=1)
                     del s0_import
                 else:
                     # change target_depth back to trace_depth and check the difference
@@ -981,8 +1003,9 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
                                       so attenuation is already baked in.
             ``jones_components``    – list of int indices recording which rows were saved.
             ``amplitude``           – *(only when inv_brems=True)* list of ``(N,)`` numpy
-                                      arrays containing the raw per-ray amplitude at each
-                                      depth snapshot.
+                                      arrays containing the per-ray amplitude ``exp(-τ)``
+                                      at each depth snapshot, where τ is the accumulated
+                                      inverse-bremsstrahlung optical depth.
             ``jvec_unweighted``     – *(only when inv_brems=True)* list of
                                       ``(n_components, N)`` numpy arrays; the geometric
                                       Jones vector **before** amplitude weighting, useful
@@ -1167,11 +1190,12 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
         from equinox import filter_jit
         _ode_solve = filter_jit(_ode_solve)
 
-    # When inv_brems is enabled, append an amplitude column (initialised to 1)
-    # to each ray so the state vector is (7,) per ray.
+    # When inv_brems is enabled, append an optical-depth column (0.0) to each
+    # ray so the state vector is (7,) per ray.  State[6] accumulates
+    # τ = ∫κ dt; amplitude is recovered as exp(-τ) at output.
     if inv_brems:
-        amplitude_init = jnp.ones((Np, 1), dtype=s0.dtype)
-        s0_T = jnp.concatenate([s0.T, amplitude_init], axis=1)  # shape (N, 7)
+        tau_init = jnp.zeros((Np, 1), dtype=s0.dtype)
+        s0_T = jnp.concatenate([s0.T, tau_init], axis=1)  # shape (N, 7)
     else:
         s0_T = s0.T  # shape (N, 6)
 
@@ -1200,7 +1224,7 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
         jvec_unweighted = np.asarray(jvec_full)[comp_indices, :]  # (n_comp, N)
 
         if inv_brems:
-            amp_j = np.asarray(sol.ys[:, j, 6])    # (N,) per-ray amplitude
+            amp_j = np.asarray(np.exp(-sol.ys[:, j, 6]))  # a = exp(-τ)
             amp_list.append(amp_j)
             jvec_list.append(jvec_unweighted * amp_j[np.newaxis, :])
             jvec_unweighted_list.append(jvec_unweighted)
