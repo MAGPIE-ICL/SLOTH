@@ -59,6 +59,9 @@ Usage::
 import os
 import sys
 import time
+import pickle
+import tempfile
+import warnings
 
 import numpy as np
 import pytest
@@ -76,7 +79,9 @@ import jax.numpy as jnp
 jax.config.update('jax_platform_name', 'cpu')
 
 from scipy.constants import c
-from core.propagator import trace_and_save_depths, kappa_inv_brems
+from core.propagator import trace_and_save_depths, kappa_inv_brems, precompute_gradients
+from core.domain import ScalarDomain
+from processing.diagnostics import Diagnostic
 
 # ---------------------------------------------------------------------------
 # Physical constants
@@ -455,3 +460,289 @@ class TestBenchmark:
                 "A mismatch suggests the amplitude ODE corrupts trajectory state."
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by the new test classes below
+# ---------------------------------------------------------------------------
+
+def _vacuum_domain(half=2e-3, n=12):
+    """Tiny vacuum (ne=0) domain — fast for API/contract tests."""
+    coords = np.linspace(-half, half, n)
+    ne = np.zeros((n, n, n), dtype=np.float32)
+
+    class _MinimalDomain:
+        pass
+
+    d = _MinimalDomain()
+    d.ne  = jnp.array(ne)
+    d.x   = jnp.array(coords, dtype=jnp.float32)
+    d.y   = jnp.array(coords, dtype=jnp.float32)
+    d.z   = jnp.array(coords, dtype=jnp.float32)
+    d.probing_direction = 'z'
+    d.lengths = jnp.array([2*half, 2*half, 2*half], dtype=jnp.float32)
+    d.dims    = jnp.array([n, n, n], dtype=jnp.int32)
+    d.Np_total = None
+    d.inv_brems = False
+    return d
+
+
+def _uniform_plasma_domain(ne_val=1e25, Te_val=100.0, Z_val=1.0, half=3e-3, n=16):
+    """Uniform absorbing plasma domain for absorption formula tests."""
+    coords = np.linspace(-half, half, n)
+    ne = np.full((n, n, n), ne_val, dtype=np.float32)
+
+    class _MinimalDomain:
+        pass
+
+    d = _MinimalDomain()
+    d.ne  = jnp.array(ne)
+    d.x   = jnp.array(coords, dtype=jnp.float32)
+    d.y   = jnp.array(coords, dtype=jnp.float32)
+    d.z   = jnp.array(coords, dtype=jnp.float32)
+    d.probing_direction = 'z'
+    d.lengths = jnp.array([2*half, 2*half, 2*half], dtype=jnp.float32)
+    d.dims    = jnp.array([n, n, n], dtype=jnp.int32)
+    d.Np_total = None
+    d.inv_brems = True
+    d.Te = jnp.float32(Te_val)
+    d.Z  = jnp.float32(Z_val)
+    return d
+
+
+def _small_rays(Np=8, z_start=-2e-3):
+    s0 = np.zeros((6, Np))
+    s0[0] = np.linspace(-5e-4, 5e-4, Np)
+    s0[2] = z_start
+    s0[5] = c
+    return jnp.array(s0, dtype=jnp.float32)
+
+
+# ---------------------------------------------------------------------------
+# TestAPIContracts
+# ---------------------------------------------------------------------------
+
+class TestAPIContracts:
+    """
+    Minimal API contract tests for trace_and_save_depths.
+
+    These protect the output structure and input-validation behaviour that
+    downstream code depends on.  The quadratic-trough classes are the physics
+    benchmark; this class protects the interface.
+    """
+
+    def _run(self, domain, **kw):
+        defaults = dict(step=500e-6, depth_max=1e-3, output_path=None,
+                        lwl=1064e-9, jitted=True, verbose=False)
+        defaults.update(kw)
+        return trace_and_save_depths(_small_rays(), domain, **defaults)
+
+    def test_output_keys_present(self):
+        """Result must have depth_saves, jvec, jones_components."""
+        result = self._run(_vacuum_domain())
+        assert 'depth_saves' in result
+        assert 'jvec' in result
+        assert 'jones_components' in result
+
+    def test_depth_saves_spacing(self):
+        """depth_saves must be uniformly spaced at the requested step."""
+        step = 200e-6
+        result = self._run(_vacuum_domain(), step=step, depth_max=1e-3)
+        diffs = np.diff(result['depth_saves'])
+        np.testing.assert_allclose(diffs, step, rtol=1e-6,
+                                   err_msg="depth_saves not uniformly spaced")
+
+    def test_domain_too_small_raises(self):
+        """depth_max larger than domain extent → ValueError."""
+        with pytest.raises(ValueError, match="smaller than the requested depth_max"):
+            self._run(_vacuum_domain(half=2e-3), depth_max=10e-3)
+
+    def test_jones_components_partial(self):
+        """'position' save must equal rows 0 and 2 of the full save."""
+        full = self._run(_vacuum_domain())
+        pos  = self._run(_vacuum_domain(), jones_components='position')
+        for j in range(len(full['jvec'])):
+            np.testing.assert_array_equal(
+                pos['jvec'][j], full['jvec'][j][[0, 2], :],
+                err_msg=f"position rows at depth {j} do not match rows 0,2 of full save",
+            )
+
+    def test_pickle_roundtrip(self):
+        """Data written to disk must reload identically."""
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as f:
+            path = f.name
+        try:
+            result = self._run(_vacuum_domain(), output_path=path)
+            with open(path, 'rb') as fh:
+                loaded = pickle.load(fh)
+            np.testing.assert_array_equal(loaded['depth_saves'], result['depth_saves'])
+            np.testing.assert_array_equal(loaded['jvec'][0], result['jvec'][0])
+        finally:
+            os.remove(path)
+
+    def test_no_amplitude_key_without_inv_brems(self):
+        """amplitude key must NOT appear when inv_brems=False."""
+        result = self._run(_vacuum_domain())
+        assert 'amplitude' not in result
+        assert 'jvec_unweighted' not in result
+
+
+# ---------------------------------------------------------------------------
+# TestAbsorptionFormula
+# ---------------------------------------------------------------------------
+
+class TestAbsorptionFormula:
+    """
+    Unit tests for the inverse-bremsstrahlung absorption formula and the
+    domain-level input validation.  These do not require the quadratic-trough
+    physics — they test the κ formula and the ODE amplitude bookkeeping.
+    """
+
+    LWL   = 1064e-9
+    HALF  = 3e-3
+    DEPTH = 2e-3
+
+    def _omega(self):
+        return 2 * np.pi * c / self.LWL
+
+    def test_analytic_amplitude_match(self):
+        """Amplitude at DEPTH must match exp(-κ·DEPTH/c) to 5 %."""
+        ne_val, Te_val, Z_val = 1e25, 100.0, 1.0
+        omega  = self._omega()
+        kappa  = float(kappa_inv_brems(jnp.float32(ne_val), jnp.float32(Te_val), Z_val, omega))
+        expected = np.exp(-kappa * self.DEPTH / c)
+
+        domain = _uniform_plasma_domain(ne_val, Te_val, Z_val, self.HALF)
+        s0     = _small_rays(Np=10, z_start=-self.HALF)
+        result = trace_and_save_depths(s0, domain,
+                                       step=500e-6, depth_max=self.DEPTH,
+                                       output_path=None, lwl=self.LWL,
+                                       jitted=True, verbose=False)
+        amp = float(np.asarray(result['amplitude'][-1]).mean())
+        np.testing.assert_allclose(amp, expected, rtol=0.05,
+                                   err_msg=f"amplitude {amp:.6f} vs analytic {expected:.6f}")
+
+    @pytest.mark.parametrize("Te_eV, Z_val", [(100.0, 1.0), (10.0, 4.0)])
+    def test_kappa_coulomb_log_formula(self, Te_eV, Z_val):
+        """kappa_inv_brems must match the reference classical-b_min formula."""
+        from scipy.constants import e as e_charge, epsilon_0 as eps0
+        ne_val = 1e25
+        omega  = self._omega()
+        ne_cc  = ne_val * 1e-6
+        v_the  = 4.19e5 * np.sqrt(Te_eV)
+        o_pe   = 5.64e4 * np.sqrt(ne_cc)
+        o_max  = max(o_pe, omega)
+        b_min  = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
+        CL     = max(2.0, np.log(v_the / (o_max * b_min)))
+        kappa_ref = 3.1e-5 * Z_val * c * (ne_cc / omega) ** 2 * CL * Te_eV ** (-1.5)
+        kappa_got = float(kappa_inv_brems(jnp.float32(ne_val), jnp.float32(Te_eV),
+                                          float(Z_val), omega))
+        np.testing.assert_allclose(kappa_got, kappa_ref, rtol=1e-4,
+                                   err_msg=f"Te={Te_eV} eV, Z={Z_val}: kappa mismatch")
+
+    def test_negative_Te_raises(self):
+        """ScalarDomain must reject negative Te."""
+        with pytest.raises(AssertionError, match="eV"):
+            ScalarDomain([4e-3, 4e-3, 4e-3], [8, 8, 8], inv_brems=True, Te=-10.0, Z=1.0)
+
+    def test_overcritical_warning(self):
+        """precompute_gradients must warn when ne ≥ ncr."""
+        omega = self._omega()
+        ncr   = 3.14207787e-4 * omega ** 2
+        coords = np.linspace(-self.HALF, self.HALF, 8)
+        x = y = z = jnp.array(coords, dtype=jnp.float32)
+        ne_over = jnp.full((8, 8, 8), 1.5 * ncr, dtype=jnp.float32)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            precompute_gradients(ne_over, x, y, z, omega)
+        assert len(caught) == 1 and issubclass(caught[0].category, UserWarning)
+
+
+# ---------------------------------------------------------------------------
+# TestDiagnosticWeighting
+# ---------------------------------------------------------------------------
+
+class TestDiagnosticWeighting:
+    """
+    Tests for per-ray amplitude weights in Diagnostic.histogram().
+
+    When inv_brems=True, the caller can pass result['amplitude'] as the
+    'weights' argument to Diagnostic to produce an intensity-weighted
+    histogram rather than a raw ray-count histogram.
+
+    Key contract:
+    * geometry (ray positions, bin edges) is unchanged by weights
+    * histogram values (bin intensities) differ when weights differ from 1
+    * default (weights=None) is backward-compatible — produces count histogram
+    """
+
+    # Use the quadratic-trough domain so rays actually deflect (more realistic)
+    _NP = 30
+
+    def _rays_and_domains(self):
+        """Return (s0, domain_no_ib, domain_ib) using the global parabolic trough."""
+        rng = np.random.RandomState(7)
+        x0  = _A * 0.4 * (rng.rand(self._NP) - 0.5)
+        s0  = _collimated_rays(x0, z_start=-_HALF_Z)
+        dom_plain = _QuadraticTroughDomain(_NE_0, _A, _HALF_Z)
+        dom_ib    = _QuadraticTroughDomain(_NE_0, _A, _HALF_Z,
+                                           inv_brems=True, Te=100.0, Z=1.0)
+        return s0, dom_plain, dom_ib
+
+    def _run(self, domain, s0):
+        return trace_and_save_depths(
+            s0, domain,
+            step=_DEPTH_MAX, depth_max=_DEPTH_MAX,
+            output_path=None, lwl=_LWL,
+            jones_components=[0, 1, 2, 3],
+            jitted=True, verbose=False,
+        )
+
+    def _build_diagnostic(self, jvec, amplitude=None):
+        """Construct a small Diagnostic object using the final jvec."""
+        rf = np.asarray(jvec)   # (4, N) geometric Jones vector
+        weights = np.asarray(amplitude) if amplitude is not None else None
+        # Use a small detector to keep the test fast
+        return Diagnostic(rf, weights=weights, L=100, R=50, Lx=50, Ly=50)
+
+    def test_unweighted_histogram_backward_compatible(self):
+        """Diagnostic without weights gives a count histogram (sum = Np)."""
+        s0, dom_plain, _ = self._rays_and_domains()
+        res = self._run(dom_plain, s0)
+        jvec = res['jvec'][-1]
+        diag = self._build_diagnostic(jvec)
+        diag.histogram(pix_x=50, pix_y=50)
+        assert diag.H.sum() == pytest.approx(self._NP, abs=2), \
+            "Unweighted histogram total should equal Np (modulo rays outside range)"
+
+    def test_weighted_histogram_total_less_than_count(self):
+        """With amplitude < 1 everywhere, weighted sum < Np."""
+        s0, dom_plain, dom_ib = self._rays_and_domains()
+        res_plain = self._run(dom_plain, s0)
+        res_ib    = self._run(dom_ib,    s0)
+        jvec = res_plain['jvec'][-1]   # geometry is identical
+        amp  = np.asarray(res_ib['amplitude'][-1])
+        diag_plain = self._build_diagnostic(jvec)
+        diag_wt    = self._build_diagnostic(jvec, amplitude=amp)
+        diag_plain.histogram(pix_x=50, pix_y=50)
+        diag_wt.histogram(pix_x=50, pix_y=50)
+        assert diag_wt.H.sum() < diag_plain.H.sum(), (
+            "Amplitude-weighted sum must be < unweighted count "
+            f"(got {diag_wt.H.sum():.4f} vs {diag_plain.H.sum():.4f})"
+        )
+
+    def test_bin_edges_identical_regardless_of_weights(self):
+        """Bin edges must be identical with and without weights — geometry unchanged."""
+        s0, dom_plain, dom_ib = self._rays_and_domains()
+        res_plain = self._run(dom_plain, s0)
+        res_ib    = self._run(dom_ib,    s0)
+        jvec = res_plain['jvec'][-1]
+        amp  = np.asarray(res_ib['amplitude'][-1])
+        diag_plain = self._build_diagnostic(jvec)
+        diag_wt    = self._build_diagnostic(jvec, amplitude=amp)
+        diag_plain.histogram(pix_x=50, pix_y=50)
+        diag_wt.histogram(pix_x=50, pix_y=50)
+        np.testing.assert_array_equal(diag_plain.xedges, diag_wt.xedges,
+                                      err_msg="x bin edges changed with amplitude weights")
+        np.testing.assert_array_equal(diag_plain.yedges, diag_wt.yedges,
+                                      err_msg="y bin edges changed with amplitude weights")
