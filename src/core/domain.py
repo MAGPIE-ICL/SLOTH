@@ -132,6 +132,13 @@ class ScalarDomain(eqx.Module):
         + plus an assortment of parameters for domain generation that can be set to override defaults
             (s, s1, s2, Ly, ne_0, ne)
 
+        :param ne: Imported electron density field **in m⁻³** (not cm⁻³).
+            If your source data is in cm⁻³ (e.g. from a FLASH simulation or the
+            ``hdf_readin`` helper), convert with ``ne_m3 = ne_cc * 1e6`` before
+            passing.  For example, a density of 10¹⁹ cm⁻³ should be passed as
+            10²⁵ m⁻³.  Required when ``ne_type="import"``.
+        :type ne: jax.Array or numpy.ndarray of shape (Nx, Ny, Nz), default: None
+
         :param inv_brems: Enable inverse bremsstrahlung amplitude attenuation.
         :type inv_brems: bool, default: False
 

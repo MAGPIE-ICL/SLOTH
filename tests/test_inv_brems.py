@@ -859,3 +859,103 @@ class TestCoulombLogClassicalRegime:
                 f"corrected value {kappa_correct:.6g} (not buggy {3.1e-5*Z_val*c*(ne_cc/omega)**2*CL_buggy*Te_eV**(-1.5):.6g})."
             ),
         )
+
+
+class TestOvercriticalWarning:
+    """
+    precompute_gradients must emit a UserWarning when any cell of *ne* equals or
+    exceeds the critical density  ncr = 3.14207787e-4 * omega².
+
+    Over-critical cells cause the gradient-term magnitude to exceed its
+    sub-critical bound, producing very large accelerations in the ODE that
+    prevent the adaptive solver from converging.  The warning tells the user to
+    check their density units (e.g. they may have passed cm⁻³ instead of m⁻³,
+    or performed the cm⁻³ → m⁻³ conversion twice).
+    """
+
+    LWL   = 1053e-9   # m — Nd:YAG third harmonic
+    HALF  = 3e-3      # m
+    N     = 8
+
+    def _omega(self):
+        return 2.0 * np.pi * c / self.LWL
+
+    def _ncr(self):
+        return 3.14207787e-4 * self._omega() ** 2
+
+    def _coords(self):
+        return np.linspace(-self.HALF, self.HALF, self.N)
+
+    # ------------------------------------------------------------------
+    # Helpers: build arrays on a tiny grid
+    # ------------------------------------------------------------------
+
+    def _ne_subcritical(self):
+        """Uniform underdense plasma: ne = 1 % ncr."""
+        return jnp.full((self.N,) * 3, 0.01 * self._ncr(), dtype=jnp.float32)
+
+    def _ne_overcritical(self):
+        """All cells above ncr (simulates a wrong unit conversion)."""
+        return jnp.full((self.N,) * 3, 1.5 * self._ncr(), dtype=jnp.float32)
+
+    def _ne_mixed(self):
+        """Mostly sub-critical but one cell just above ncr."""
+        ne = np.full((self.N,) * 3, 0.5 * self._ncr(), dtype=np.float32)
+        ne[0, 0, 0] = 1.01 * self._ncr()
+        return jnp.array(ne)
+
+    # ------------------------------------------------------------------
+
+    def test_no_warning_for_subcritical(self):
+        """Sub-critical plasma must not trigger any warning."""
+        from core.propagator import precompute_gradients
+        coords = self._coords()
+        x = y = z = jnp.array(coords, dtype=jnp.float32)
+        ne = self._ne_subcritical()
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning becomes an error
+            precompute_gradients(ne, x, y, z, self._omega())  # must not raise
+
+    def test_warning_for_overcritical(self):
+        """Fully over-critical plasma must emit a UserWarning."""
+        from core.propagator import precompute_gradients
+        coords = self._coords()
+        x = y = z = jnp.array(coords, dtype=jnp.float32)
+        ne = self._ne_overcritical()
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            precompute_gradients(ne, x, y, z, self._omega())
+        assert len(caught) == 1
+        assert issubclass(caught[0].category, UserWarning)
+        msg = str(caught[0].message).lower()
+        assert "critical" in msg or "ncr" in msg or "ne/ncr" in msg
+
+    def test_warning_for_mixed_domain(self):
+        """A domain with even one over-critical cell must emit a UserWarning."""
+        from core.propagator import precompute_gradients
+        coords = self._coords()
+        x = y = z = jnp.array(coords, dtype=jnp.float32)
+        ne = self._ne_mixed()
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            precompute_gradients(ne, x, y, z, self._omega())
+        assert len(caught) == 1
+        assert issubclass(caught[0].category, UserWarning)
+
+    def test_warning_mentions_unit_conversion(self):
+        """The warning message should guide the user toward the unit fix."""
+        from core.propagator import precompute_gradients
+        coords = self._coords()
+        x = y = z = jnp.array(coords, dtype=jnp.float32)
+        ne = self._ne_overcritical()
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            precompute_gradients(ne, x, y, z, self._omega())
+        assert len(caught) == 1
+        msg = str(caught[0].message)
+        # message must mention the conversion recipe
+        assert "1e6" in msg or "ne_cc" in msg or "cm" in msg

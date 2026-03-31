@@ -57,7 +57,11 @@ def precompute_gradients(ne, x, y, z, omega):
     remains well within float32 range for any sub-critical plasma.
 
     Args:
-        ne    (jax.Array): Electron density grid in m⁻³, shape ``(Nx, Ny, Nz)``.
+        ne    (jax.Array): Electron density grid **in m⁻³**, shape ``(Nx, Ny, Nz)``.
+            If your density is in cm⁻³ convert with ``ne_m3 = ne_cc * 1e6`` before
+            passing.  Cells with ``ne ≥ ncr`` (critical density) are physically
+            evanescent; the function warns if any such cells are present, as this
+            causes large gradient magnitudes that can prevent the ODE from converging.
         x, y, z (jax.Array): 1-D coordinate arrays in metres.
         omega (float): Laser angular frequency in rad/s.
 
@@ -65,6 +69,20 @@ def precompute_gradients(ne, x, y, z, omega):
         tuple: ``(dndx, dndy, dndz)`` — each a ``(Nx, Ny, Nz)`` JAX array giving
         the gradient of ``gradient_term`` along the respective axis.
     """
+    # Critical density for this laser frequency [m^-3]: ncr = me*eps0*omega^2/e^2
+    ncr = 3.14207787e-4 * float(omega) ** 2
+    ne_max = float(jnp.max(ne))
+    if ne_max >= ncr:
+        import warnings
+        warnings.warn(
+            f"precompute_gradients: {ne_max:.3g} m⁻³ cells at or above critical "
+            f"density ncr = {ncr:.3g} m⁻³ (ne/ncr = {ne_max/ncr:.2g}).  "
+            "This causes large gradient magnitudes that prevent ODE convergence.  "
+            "Check that ne is in m⁻³ (not cm⁻³ — convert with ne_cc * 1e6) and "
+            "that your domain does not include over-critical cells.",
+            stacklevel=2,
+        )
+
     # Compute the scalar coefficient in float64 to preserve precision, then
     # cast to the dtype of ne to avoid widening the array unnecessarily.
     coeff = np.float64(-0.5) * float(c) ** 2 / (3.14207787e-4 * float(omega) ** 2)
