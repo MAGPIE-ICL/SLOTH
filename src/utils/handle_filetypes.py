@@ -119,7 +119,8 @@ def pvti_readin(filename):
     #dim = img.shape
     return img, img.shape, spacing
 
-def hdf_readin(filename, *, prefer_ye=True, force_override=True, verbose=False):
+def hdf_readin(filename, *, prefer_ye=True, force_override=True, verbose=False,
+               return_tele=False, return_z=False):
     """
     Load a FLASH/yt-readable HDF5 file and return an electron-density field on a
     uniform covering grid.
@@ -133,21 +134,33 @@ def hdf_readin(filename, *, prefer_ye=True, force_override=True, verbose=False):
          (This matches your original scaling: Ye = Z/A, N_A = 6.022e23)
        - Otherwise falls back to a simple scaled proxy:
             ne = 5e23 * rho
-    3) Builds a covering_grid at the maximum AMR level and returns:
+    3) Optionally defines a derived field ("flash","z") for the mean ionic charge
+       state, computed from the FLASH fields ye (= Z/A) and sumy (= 1/A):
+            z = ye / sumy
+    4) Builds a covering_grid at the maximum AMR level and returns:
        - ne: yt array on the covering grid
        - dims: integer grid dimensions
        - spacing: cell spacing per axis (yt quantities)
+       - extras (only when return_tele or return_z is True): dict containing
+         any of the keys "tele" and/or "z" as yt arrays on the covering grid.
 
     Parameters
     ----------
     filename : str or Path
         Path to the HDF5 file.
     prefer_ye : bool
-        If True, use ("flash","ye") when available.
+        If True, use ("flash","ye") when available to compute ne.
     force_override : bool
-        If True, overwrite ("flash","ne") if it already exists in the session.
+        If True, overwrite derived fields if they already exist in the session.
     verbose : bool
         If True, print field availability and grid info.
+    return_tele : bool
+        If True, also extract the electron temperature field ("flash","tele")
+        and include it in the returned extras dict.
+    return_z : bool
+        If True, derive the mean ionic charge state z = ye / sumy and include
+        it in the returned extras dict.  Requires ("flash","ye") and
+        ("flash","sumy") to be present in the file.
 
     Returns
     -------
@@ -157,20 +170,30 @@ def hdf_readin(filename, *, prefer_ye=True, force_override=True, verbose=False):
         Grid dimensions at max AMR level.
     spacing : list
         Cell spacing along each axis (yt quantities).
+    extras : dict, only present when return_tele=True or return_z=True
+        Optional additional fields on the covering grid:
+        - "tele": electron temperature (if return_tele=True)
+        - "z": mean ionic charge state (if return_z=True)
     """
     import yt
 
     ds = yt.load(filename)
 
-    # ---- Detect if Ye exists (on the dataset, not on the data container)
+    # ---- Detect field availability
     field_ye = ("flash", "ye")
+    field_sumy = ("flash", "sumy")
+    field_tele = ("flash", "tele")
     has_ye = (field_ye in ds.field_list) or (field_ye in ds.derived_field_list)
+    has_sumy = (field_sumy in ds.field_list) or (field_sumy in ds.derived_field_list)
+    has_tele = (field_tele in ds.field_list) or (field_tele in ds.derived_field_list)
 
     if verbose:
         print(f"[hdf_readin] Loaded: {filename}")
         print(f"[hdf_readin] has_ye={has_ye} (prefer_ye={prefer_ye})")
+        print(f"[hdf_readin] has_sumy={has_sumy}")
+        print(f"[hdf_readin] has_tele={has_tele}")
 
-    # ---- Derived field definition
+    # ---- Derived field: ne
     # Keep your original coefficient (Avogadro's number in 1/mol)
     N_A = 6.022e23
 
@@ -197,6 +220,26 @@ def hdf_readin(filename, *, prefer_ye=True, force_override=True, verbose=False):
         force_override=force_override,
     )
 
+    # ---- Derived field: z = ye / sumy  (Z/A divided by 1/A = Z)
+    if return_z:
+        if not (has_ye and has_sumy):
+            raise ValueError(
+                "[hdf_readin] return_z=True requires both ('flash','ye') and "
+                "('flash','sumy') to be present in the file, but one or both "
+                "are missing."
+            )
+
+        def _z(field, data):
+            return data[field_ye] / data[field_sumy]
+
+        ds.add_field(
+            name=("flash", "z"),
+            function=_z,
+            sampling_type="local",
+            units="dimensionless",
+            force_override=force_override,
+        )
+
     # ---- Build covering grid at max AMR level
     level = ds.index.max_level
     dims = ds.domain_dimensions * (ds.refine_by ** level)
@@ -219,6 +262,20 @@ def hdf_readin(filename, *, prefer_ye=True, force_override=True, verbose=False):
         print(f"[hdf_readin] max_level={level}")
         print(f"[hdf_readin] dims={tuple(int(x) for x in np.array(dims))}")
         print(f"[hdf_readin] spacing={spacing}")
+
+    # ---- Collect optional extra fields
+    if return_tele or return_z:
+        if return_tele and not has_tele:
+            raise ValueError(
+                "[hdf_readin] return_tele=True requires ('flash','tele') to be "
+                "present in the file, but it is missing."
+            )
+        extras = {}
+        if return_tele:
+            extras["tele"] = cube[("flash", "tele")]
+        if return_z:
+            extras["z"] = cube[("flash", "z")]
+        return ne, dims, spacing, extras
 
     return ne, dims, spacing
 
