@@ -77,7 +77,8 @@ def kappa_inv_brems(ne, Te, Z, omega):
         ne  (jax.Array or float): Electron density in m\ :sup:`-3`.
         Te  (jax.Array or float): Electron temperature in eV.  May be a scalar
             (uniform temperature) or a 3-D array with the same shape as *ne*.
-        Z   (float): Mean ion charge state (dimensionless).
+        Z   (jax.Array or float): Mean ion charge state (dimensionless).  May be a scalar
+            (uniform charge state) or a 3-D array with the same shape as *ne*.
         omega (float): Laser angular frequency in rad/s.
 
     Returns:
@@ -563,7 +564,7 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
                 kappa_grid = kappa_inv_brems(
                     ScalarDomain.ne,
                     ScalarDomain.Te,
-                    float(ScalarDomain.Z),
+                    ScalarDomain.Z,
                     omega,
                 )
 
@@ -1051,7 +1052,7 @@ def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
         kappa = kappa_inv_brems(
             ScalarDomain.ne,
             ScalarDomain.Te,
-            float(ScalarDomain.Z),
+            ScalarDomain.Z,
             omega,
         )
 

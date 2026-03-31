@@ -60,7 +60,7 @@ class _MinimalDomain:
             self.Te = jnp.asarray(Te, dtype=jnp.float32)
         else:
             self.Te = None
-        self.Z = jnp.float32(Z) if Z is not None else None
+        self.Z = jnp.asarray(Z, dtype=jnp.float32) if Z is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -363,3 +363,109 @@ class TestWeightedJvec:
                 f"jvec_unweighted {jv_u.shape}"
             )
 
+
+class TestArrayZ:
+    """Z charge state can be a spatially varying array, not just a scalar."""
+
+    NE_VAL  = 1e25
+    TE_VAL  = 100.0
+    Z_VAL   = 1.0
+    LWL     = 1064e-9
+    DEPTH   = 2e-3
+    HALF    = 3e-3
+
+    def _domain_with_scalar_z(self, n=20):
+        coords = np.linspace(-self.HALF, self.HALF, n)
+        ne     = np.full((n, n, n), self.NE_VAL, dtype=np.float32)
+        return _MinimalDomain(
+            ne, coords, coords, coords, probing_direction='z',
+            inv_brems=True, Te=self.TE_VAL, Z=self.Z_VAL,
+        )
+
+    def _domain_with_uniform_array_z(self, n=20):
+        """Z supplied as a 3-D array filled with the same scalar value."""
+        coords = np.linspace(-self.HALF, self.HALF, n)
+        ne     = np.full((n, n, n), self.NE_VAL, dtype=np.float32)
+        Z_arr  = np.full((n, n, n), self.Z_VAL, dtype=np.float32)
+        return _MinimalDomain(
+            ne, coords, coords, coords, probing_direction='z',
+            inv_brems=True, Te=self.TE_VAL, Z=Z_arr,
+        )
+
+    def test_array_z_stored_as_array(self):
+        """When Z is provided as a 3-D array it must be stored as a JAX array with correct values."""
+        domain = self._domain_with_uniform_array_z()
+        assert hasattr(domain.Z, 'shape'), "Z should be a JAX array with a .shape attribute"
+        assert domain.Z.shape == (20, 20, 20), f"Unexpected Z shape: {domain.Z.shape}"
+        np.testing.assert_allclose(
+            np.asarray(domain.Z), self.Z_VAL, rtol=1e-6,
+            err_msg="Array Z values should all equal Z_VAL",
+        )
+
+    def test_scalar_z_stored_as_array(self):
+        """When Z is provided as a scalar it must also be stored as a JAX array with the correct value."""
+        domain = self._domain_with_scalar_z()
+        assert hasattr(domain.Z, 'shape'), "Z should be a JAX array with a .shape attribute"
+        assert float(domain.Z) == self.Z_VAL, (
+            f"Scalar Z value {float(domain.Z)} should equal Z_VAL {self.Z_VAL}"
+        )
+
+    def test_uniform_array_z_matches_scalar_z(self):
+        """A uniform array Z must produce the same final amplitude as the equivalent scalar Z."""
+        s0 = _collimated_rays(Np=12, beam_radius=2e-4, z_start=-self.HALF)
+
+        def _run(domain):
+            result = trace_and_save_depths(
+                s0, domain,
+                step=500e-6, depth_max=self.DEPTH,
+                output_path=None,
+                lwl=self.LWL, jitted=True, verbose=False,
+            )
+            return float(np.asarray(result['amplitude'][-1]).mean())
+
+        amp_scalar = _run(self._domain_with_scalar_z())
+        amp_array  = _run(self._domain_with_uniform_array_z())
+
+        np.testing.assert_allclose(
+            amp_array, amp_scalar, rtol=1e-5,
+            err_msg=(
+                f"Uniform array Z ({amp_array:.8f}) should match scalar Z ({amp_scalar:.8f})"
+            ),
+        )
+
+    def test_varying_z_changes_absorption(self):
+        """A higher Z in the beam path must produce more absorption than Z=1."""
+        n      = 20
+        coords = np.linspace(-self.HALF, self.HALF, n)
+        ne     = np.full((n, n, n), self.NE_VAL, dtype=np.float32)
+
+        # Z=1 everywhere (low absorption)
+        domain_low_z = _MinimalDomain(
+            ne, coords, coords, coords, probing_direction='z',
+            inv_brems=True, Te=self.TE_VAL, Z=1.0,
+        )
+
+        # Z=4 everywhere (high absorption)
+        domain_high_z = _MinimalDomain(
+            ne, coords, coords, coords, probing_direction='z',
+            inv_brems=True, Te=self.TE_VAL, Z=4.0,
+        )
+
+        s0 = _collimated_rays(Np=12, beam_radius=2e-4, z_start=-self.HALF)
+
+        def _run(domain):
+            result = trace_and_save_depths(
+                s0, domain,
+                step=500e-6, depth_max=self.DEPTH,
+                output_path=None,
+                lwl=self.LWL, jitted=True, verbose=False,
+            )
+            return float(np.asarray(result['amplitude'][-1]).mean())
+
+        amp_low  = _run(domain_low_z)
+        amp_high = _run(domain_high_z)
+
+        assert amp_high < amp_low, (
+            f"Expected higher Z to give lower amplitude: Z=4 gave {amp_high:.6f}, "
+            f"Z=1 gave {amp_low:.6f}"
+        )

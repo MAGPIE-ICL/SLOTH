@@ -78,7 +78,7 @@ class ScalarDomain(eqx.Module):
 
     inv_brems: bool
     Te: jax.Array
-    Z: jnp.float32
+    Z: jax.Array
 
     def __init__(self, lengths, dims, *, ne_type = None, probing_direction = 'z', auto_batching = True, iteration = 1, region_count = 1, leeway_factor = None, coord_backup = None, future_dims = None, extra_info = False, memory_reporting = False, memory_limit = None, Np = None,
         s = None, s1 = None, s2 = None, Ly = None, ne_0 = None, ne = None,
@@ -139,8 +139,9 @@ class ScalarDomain(eqx.Module):
             a 3-D array with the same shape as *ne*.  Required when *inv_brems* is True.
         :type Te: float or jax.Array, default: None
 
-        :param Z: Mean ion charge state (dimensionless).  Required when *inv_brems* is True.
-        :type Z: float, default: None
+        :param Z: Mean ion charge state (dimensionless).  Can be a scalar (applied uniformly)
+            or a 3-D array with the same shape as *ne*.  Required when *inv_brems* is True.
+        :type Z: float or jax.Array, default: None
 
         :raise Exception: If lengths or dims are an array of len(...) != 1 but not len(...) == 3
         :raise AssertionError: If ne_type is changed from the default but not set to a valid type.
@@ -186,7 +187,7 @@ class ScalarDomain(eqx.Module):
             self.Te = jnp.asarray(Te, dtype=jnp.float32)
         else:
             self.Te = None
-        self.Z = jnp.float32(Z) if Z is not None else None
+        self.Z = jnp.asarray(Z, dtype=jnp.float32) if Z is not None else None
 
         # working with 10% leeway in estimate for now
         if leeway_factor is not None:
