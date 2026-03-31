@@ -252,7 +252,7 @@ class ScalarDomain:
             o_pe  = self.omega_pe(ne)
             o_max = np.copy(o_pe)
             o_max[o_pe < omega] = omega
-            L_classical = Z*sc.e/Te
+            L_classical = Z*sc.e/(4.0*np.pi*sc.epsilon_0*Te)  # b_classical = Ze/(4πε₀ T_e[eV]) [m]
             L_quantum = 2.760428269727312e-10/np.sqrt(Te) # sc.hbar/np.sqrt(sc.m_e*sc.e*Te)
             L_max = np.maximum(L_classical, L_quantum)
 
