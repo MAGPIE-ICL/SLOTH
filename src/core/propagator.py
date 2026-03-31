@@ -107,16 +107,24 @@ def kappa_inv_brems(ne, Te, Z, omega):
 
     Args:
         ne  (jax.Array or float): Electron density in m\ :sup:`-3`.
-        Te  (jax.Array or float): Electron temperature in eV.  May be a scalar
-            (uniform temperature) or a 3-D array with the same shape as *ne*.
+        Te  (jax.Array or float): Electron temperature **in eV** (not Kelvin,
+            not Joules).  Must be strictly positive.  May be a scalar (uniform
+            temperature) or a 3-D array with the same shape as *ne*.
         Z   (jax.Array or float): Mean ion charge state (dimensionless).  May be a scalar
             (uniform charge state) or a 3-D array with the same shape as *ne*.
         omega (float): Laser angular frequency in rad/s.
 
     Returns:
-        jax.Array: Absorption rate with the same shape as *ne*, units of 1/s.
+        jax.Array: Amplitude absorption rate with the same shape as *ne*, units of 1/s.
+
+    Note:
+        The Coulomb logarithm uses the correct classical minimum impact
+        parameter ``b_classical = Z·e / (4πε₀·Tₑ[eV])`` [m].  For cold
+        plasmas or high-Z ions (Tₑ < ~27·Z² eV) this dominates over the
+        quantum parameter and reduces the Coulomb log relative to the
+        quantum-only limit.
     """
-    from scipy.constants import e as e_charge
+    from scipy.constants import e as e_charge, epsilon_0
 
     ne_cc = ne * 1e-6  # convert m^-3 to cm^-3
 
@@ -129,9 +137,11 @@ def kappa_inv_brems(ne, Te, Z, omega):
     # Upper limit for Coulomb logarithm argument: max(omega_pe, omega)
     o_max = jnp.maximum(o_pe, omega)
 
-    # Classical and quantum minimum impact parameters
-    L_classical = Z * e_charge / Te                          # Z * e [C] / Te [eV] = Z * e / (Te * e) [m] → metres
-    L_quantum   = 2.760428269727312e-10 / jnp.sqrt(Te)      # hbar/sqrt(m_e * e) / sqrt(Te[eV]) [m]; constant = hbar/sqrt(m_e*e) in SI
+    # Classical and quantum minimum impact parameters.
+    # b_classical = Z e² / (4πε₀ k_B T_e) = Z e / (4πε₀ T_e[eV])  [m]
+    # b_quantum   = ħ / (m_e v_th) = 2.76e-10 / sqrt(T_e[eV])      [m]
+    L_classical = Z * e_charge / (4.0 * np.pi * epsilon_0 * Te)  # classical minimum impact parameter [m]
+    L_quantum   = 2.760428269727312e-10 / jnp.sqrt(Te)           # quantum minimum impact parameter [m]
     L_max       = jnp.maximum(L_classical, L_quantum)
 
     # Coulomb logarithm (clamped to ≥ 2)

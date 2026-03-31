@@ -11,6 +11,11 @@ Physics checks:
      depth save in a uniform plasma.
   4. Density scaling: a denser plasma produces stronger attenuation
      (lower final amplitude) than a dilute plasma with the same Te and Z.
+  5. Wavelength scaling: kappa ∝ (ne/ω)², so higher frequency means less absorption.
+  6. Np independence: amplitude must not depend on the number of rays traced.
+  7. Coulomb logarithm classical regime: for cold plasma or high-Z ions where the
+     classical minimum impact parameter b_classical = Ze/(4πε₀·Te) exceeds the
+     quantum parameter b_quantum, the correct b_min must be used.
 """
 
 import os
@@ -18,6 +23,7 @@ import sys
 
 import numpy as np
 import pytest
+import scipy.constants
 
 # ---------------------------------------------------------------------------
 # Make sure the project source is importable without installing the package
@@ -31,8 +37,9 @@ import jax.numpy as jnp
 
 jax.config.update('jax_platform_name', 'cpu')
 
-from scipy.constants import c
+from scipy.constants import c, epsilon_0
 from core.propagator import trace_and_save_depths, kappa_inv_brems
+from core.domain import ScalarDomain
 
 
 # ---------------------------------------------------------------------------
@@ -295,12 +302,92 @@ class TestNoAmplitudeKeyWithoutIB:
         )
 
 
+class TestTeUnitValidation:
+    """
+    Te must be supplied in electron-volts (eV), not Kelvin or Joules.
+    The domain must reject zero or negative Te at construction time to prevent
+    silent NaN/inf values in kappa_inv_brems (which uses sqrt(Te), Te^-1.5, etc).
+    """
+
+    # Minimal valid domain parameters used throughout
+    _LENGTHS = [4e-3, 4e-3, 4e-3]
+    _DIMS    = [8, 8, 8]
+
+    def test_negative_Te_raises_on_ScalarDomain(self):
+        """Negative Te must raise AssertionError with a helpful message."""
+        with pytest.raises(AssertionError, match="eV"):
+            ScalarDomain(self._LENGTHS, self._DIMS,
+                         inv_brems=True, Te=-10.0, Z=1.0)
+
+    def test_zero_Te_raises_on_ScalarDomain(self):
+        """Zero Te must raise AssertionError (division by zero in kappa formula)."""
+        with pytest.raises(AssertionError, match="eV"):
+            ScalarDomain(self._LENGTHS, self._DIMS,
+                         inv_brems=True, Te=0.0, Z=1.0)
+
+    def test_negative_Te_array_raises_on_ScalarDomain(self):
+        """A 3-D Te array containing a negative value must also raise."""
+        n = 8
+        Te_arr = np.full((n, n, n), 100.0, dtype=np.float32)
+        Te_arr[0, 0, 0] = -1.0   # one bad cell
+        with pytest.raises(AssertionError, match="eV"):
+            ScalarDomain(self._LENGTHS, self._DIMS,
+                         inv_brems=True, Te=Te_arr, Z=1.0)
+
+    def test_kappa_is_nan_or_inf_for_zero_Te(self):
+        """
+        Directly calling kappa_inv_brems with Te=0 produces non-finite output,
+        confirming the domain-level validation is necessary to prevent silent errors.
+        """
+        kappa_val = kappa_inv_brems(
+            jnp.float32(1e25), jnp.float32(0.0), 1.0,
+            2 * np.pi * c / 1064e-9,
+        )
+        assert not np.isfinite(float(kappa_val)), (
+            "kappa_inv_brems with Te=0 should be non-finite (inf or nan)"
+        )
+
+    def test_positive_Te_eV_is_accepted(self):
+        """Typical ICF/laser-plasma Te values in eV must be accepted without error."""
+        for Te_val in [0.1, 1.0, 100.0, 1000.0, 1e4]:
+            # Should not raise
+            d = ScalarDomain(self._LENGTHS, self._DIMS,
+                             inv_brems=True, Te=float(Te_val), Z=1.0)
+            assert float(d.Te) == pytest.approx(Te_val, rel=1e-5), (
+                f"Te={Te_val} eV was stored incorrectly: got {float(d.Te)}"
+            )
+
+    def test_kelvin_scale_Te_not_rejected_but_kappa_is_huge(self):
+        """
+        Te supplied in Kelvin (e.g. 1.16e6 K for 100 eV) is not rejected
+        (the domain cannot distinguish units), but produces a physically absurd
+        kappa value — orders of magnitude smaller than the eV equivalent.
+
+        kappa ∝ Te^(-3/2), so Te_K ≈ 1.16e4 × Te_eV gives
+        kappa_K ≈ kappa_eV / (1.16e4)^(3/2).  This test documents the behaviour
+        and motivates always passing Te in eV.
+        """
+        Te_eV      = 100.0              # correct usage
+        Te_kelvin  = 100.0 * scipy.constants.physical_constants['electron volt-kelvin relationship'][0]  # same temperature in Kelvin
+
+        omega = 2 * np.pi * c / 1064e-9
+        kappa_eV     = float(kappa_inv_brems(
+            jnp.float32(1e25), jnp.float32(Te_eV),     1.0, omega))
+        kappa_kelvin = float(kappa_inv_brems(
+            jnp.float32(1e25), jnp.float32(Te_kelvin), 1.0, omega))
+
+        # kappa_eV >> kappa_kelvin because kappa ∝ Te^(-3/2)
+        assert kappa_eV > kappa_kelvin * 100, (
+            "kappa with Te in eV should be >> kappa with Te in Kelvin, "
+            "confirming that passing Te in Kelvin gives wrong (far too small) results."
+        )
+
+
 class TestWeightedJvec:
     """
     When inv_brems=True the returned jvec must be the amplitude-weighted Jones
     vector, and jvec_unweighted must equal jvec / amplitude.
     """
-
     NE_VAL = 1e25
     TE_VAL = 100.0
     Z_VAL  = 1.0
@@ -468,4 +555,326 @@ class TestArrayZ:
         assert amp_high < amp_low, (
             f"Expected higher Z to give lower amplitude: Z=4 gave {amp_high:.6f}, "
             f"Z=1 gave {amp_low:.6f}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# New tests: wavelength scaling, Np independence, Coulomb-log classical regime
+# ---------------------------------------------------------------------------
+
+class TestWavelengthScaling:
+    """
+    Inverse bremsstrahlung absorption scales as κ ∝ (nₑ/ω)², so higher laser
+    frequency (shorter wavelength) produces less absorption.
+
+    For each wavelength the measured amplitude at a fixed depth must match the
+    analytic formula  a(L) = exp(-κ · L/c)  where κ = kappa_inv_brems(..., ω).
+    """
+
+    NE_VAL = 1e25    # m^-3  — underdense for all three wavelengths
+    TE_VAL = 100.0   # eV
+    Z_VAL  = 1.0
+    DEPTH  = 2e-3    # m
+    HALF   = 3e-3    # domain half-size (m)
+
+    def _expected_amplitude(self, lwl):
+        omega = 2 * np.pi * c / lwl
+        kappa = float(kappa_inv_brems(
+            jnp.float32(self.NE_VAL),
+            jnp.float32(self.TE_VAL),
+            self.Z_VAL,
+            omega,
+        ))
+        return np.exp(-kappa * self.DEPTH / c)
+
+    @pytest.mark.parametrize("lwl", [351e-9, 527e-9, 1064e-9])
+    def test_amplitude_matches_analytic_at_wavelength(self, lwl):
+        """Amplitude at DEPTH matches exp(-κ·L/c) for each laser wavelength."""
+        domain = _uniform_plasma_domain(
+            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            half_size=self.HALF, n=24,
+        )
+        s0 = _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
+
+        result = trace_and_save_depths(
+            s0, domain,
+            step=500e-6, depth_max=self.DEPTH,
+            output_path=None,
+            lwl=lwl, jitted=True, verbose=False,
+        )
+
+        amp_final = float(np.asarray(result['amplitude'][-1]).mean())
+        expected  = self._expected_amplitude(lwl)
+
+        np.testing.assert_allclose(
+            amp_final, expected, rtol=0.05,
+            err_msg=(
+                f"Wavelength {lwl*1e9:.0f} nm: final amplitude {amp_final:.6f} "
+                f"differs from analytic {expected:.6f} by more than 5 %"
+            ),
+        )
+
+    def test_shorter_wavelength_less_absorption(self):
+        """
+        351 nm (3ω) must produce more surviving amplitude than 1064 nm (1ω)
+        because κ ∝ 1/ω² — higher frequency means weaker absorption.
+        """
+        domain = _uniform_plasma_domain(
+            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            half_size=self.HALF, n=24,
+        )
+        s0 = _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
+
+        def _run(lwl):
+            result = trace_and_save_depths(
+                s0, domain,
+                step=500e-6, depth_max=self.DEPTH,
+                output_path=None,
+                lwl=lwl, jitted=True, verbose=False,
+            )
+            return float(np.asarray(result['amplitude'][-1]).mean())
+
+        amp_351  = _run(351e-9)
+        amp_1064 = _run(1064e-9)
+
+        assert amp_351 > amp_1064, (
+            f"Expected 351 nm (amp={amp_351:.6f}) to survive more than 1064 nm "
+            f"(amp={amp_1064:.6f}); κ ∝ 1/ω² so higher ω → less absorption."
+        )
+
+    def test_kappa_scales_as_inverse_omega_squared(self):
+        """
+        κ ∝ (nₑ/ω)² × CL(ω), where CL changes with ω through ω_max = max(ωpe, ω).
+
+        For the same plasma, the ratio κ(351nm)/κ(1064nm) must match the value
+        predicted by the full formula — i.e. (ω_1064/ω_351)² multiplied by the
+        ratio of the Coulomb logarithms at the two frequencies.  This confirms
+        the dominant ω⁻² scaling is correct while properly accounting for the
+        Coulomb-log variation with laser frequency.
+        """
+        from scipy.constants import e as e_charge, epsilon_0 as eps0
+
+        ne_val = self.NE_VAL
+        Te_eV  = self.TE_VAL
+        Z_val  = self.Z_VAL
+        ne_cc  = ne_val * 1e-6
+
+        def _coulomb_log(omega):
+            """Reference CL using the correct b_classical."""
+            v_the = 4.19e5 * np.sqrt(Te_eV)
+            o_pe  = 5.64e4 * np.sqrt(ne_cc)
+            o_max = max(o_pe, omega)
+            b_c   = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
+            b_q   = 2.760428269727312e-10 / np.sqrt(Te_eV)
+            return max(2.0, np.log(v_the / (o_max * max(b_c, b_q))))
+
+        omega_351  = 2 * np.pi * c / 351e-9
+        omega_1064 = 2 * np.pi * c / 1064e-9
+
+        cl_351  = _coulomb_log(omega_351)
+        cl_1064 = _coulomb_log(omega_1064)
+
+        # Expected ratio: dominant (ω₂/ω₁)² term, corrected for CL variation
+        expected_ratio = (omega_1064 / omega_351) ** 2 * (cl_351 / cl_1064)
+
+        kappa_351  = float(kappa_inv_brems(
+            jnp.float32(ne_val), jnp.float32(Te_eV), Z_val, omega_351))
+        kappa_1064 = float(kappa_inv_brems(
+            jnp.float32(ne_val), jnp.float32(Te_eV), Z_val, omega_1064))
+
+        computed_ratio = kappa_351 / kappa_1064
+
+        np.testing.assert_allclose(
+            computed_ratio, expected_ratio, rtol=1e-3,
+            err_msg=(
+                f"κ(351nm)/κ(1064nm) = {computed_ratio:.5f}, "
+                f"expected {expected_ratio:.5f} (ω² × CL ratio)"
+            ),
+        )
+
+
+class TestNpScaling:
+    """
+    Each ray is traced independently, so the mean amplitude must not depend on
+    the total number of rays Np (within sampling noise and ODE tolerances).
+    """
+
+    NE_VAL = 1e25    # m^-3
+    TE_VAL = 100.0   # eV
+    Z_VAL  = 1.0
+    LWL    = 1064e-9
+    DEPTH  = 2e-3    # m
+    HALF   = 3e-3
+
+    def _expected_amplitude(self):
+        omega = 2 * np.pi * c / self.LWL
+        kappa = float(kappa_inv_brems(
+            jnp.float32(self.NE_VAL), jnp.float32(self.TE_VAL), self.Z_VAL, omega))
+        return np.exp(-kappa * self.DEPTH / c)
+
+    @pytest.mark.parametrize("Np", [10, 50, 100, 500])
+    def test_amplitude_matches_analytic_for_Np(self, Np):
+        """Mean amplitude must match the analytic formula regardless of Np."""
+        expected = self._expected_amplitude()
+
+        domain = _uniform_plasma_domain(
+            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            half_size=self.HALF, n=24,
+        )
+        s0 = _collimated_rays(Np=Np, beam_radius=2e-4, z_start=-self.HALF)
+
+        result = trace_and_save_depths(
+            s0, domain,
+            step=500e-6, depth_max=self.DEPTH,
+            output_path=None,
+            lwl=self.LWL, jitted=True, verbose=False,
+        )
+
+        amp_final = float(np.asarray(result['amplitude'][-1]).mean())
+
+        np.testing.assert_allclose(
+            amp_final, expected, rtol=0.05,
+            err_msg=(
+                f"Np={Np}: amplitude {amp_final:.6f} differs from analytic "
+                f"{expected:.6f} by more than 5 %"
+            ),
+        )
+
+    def test_mean_amplitude_consistent_across_Np(self):
+        """
+        The mean amplitude from Np=50 and Np=200 must agree to within 5 %
+        (independent of number of rays).
+        """
+        domain = _uniform_plasma_domain(
+            self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
+            half_size=self.HALF, n=24,
+        )
+
+        def _run(Np):
+            s0 = _collimated_rays(Np=Np, beam_radius=2e-4, z_start=-self.HALF)
+            result = trace_and_save_depths(
+                s0, domain,
+                step=500e-6, depth_max=self.DEPTH,
+                output_path=None,
+                lwl=self.LWL, jitted=True, verbose=False,
+            )
+            return float(np.asarray(result['amplitude'][-1]).mean())
+
+        amp_50  = _run(50)
+        amp_200 = _run(200)
+
+        np.testing.assert_allclose(
+            amp_200, amp_50, rtol=0.05,
+            err_msg=(
+                f"Mean amplitude differs between Np=50 ({amp_50:.6f}) and "
+                f"Np=200 ({amp_200:.6f}) by more than 5 %"
+            ),
+        )
+
+
+class TestCoulombLogClassicalRegime:
+    """
+    When the classical minimum impact parameter
+        b_classical = Z·e / (4πε₀·Tₑ[eV])   [m]
+    exceeds the quantum one
+        b_quantum   = 2.76e-10 / √Tₑ[eV]     [m],
+    the Coulomb logarithm must use b_classical as b_min.
+
+    This happens for cold plasmas (Tₑ < ~27 Z² eV).  The original buggy code
+    used  b_classical = Z·e / Tₑ  (missing 1/(4πε₀)), so b_classical was ~9×10⁹
+    times too small and the quantum term always dominated — overestimating the
+    Coulomb logarithm and therefore kappa.
+
+    These tests verify that kappa_inv_brems returns the value consistent with the
+    correct Coulomb log in both the classical and quantum regimes.
+    """
+
+    @staticmethod
+    def _reference_kappa(ne_val, Te_eV, Z_val, omega):
+        """Compute the expected kappa using the correct physics formulae."""
+        from scipy.constants import e as e_charge, epsilon_0 as eps0
+        ne_cc = ne_val * 1e-6
+        v_the = 4.19e5 * np.sqrt(Te_eV)
+        o_pe  = 5.64e4 * np.sqrt(ne_cc)
+        o_max = max(o_pe, omega)
+        # correct classical minimum impact parameter
+        b_classical = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
+        b_quantum   = 2.760428269727312e-10 / np.sqrt(Te_eV)
+        b_min       = max(b_classical, b_quantum)
+        CL = max(2.0, np.log(v_the / (o_max * b_min)))
+        return 3.1e-5 * Z_val * c * (ne_cc / omega) ** 2 * CL * Te_eV ** (-1.5)
+
+    # (Te_eV, Z_val) pairs — classical regime (b_classical > b_quantum) marked *
+    @pytest.mark.parametrize("Te_eV, Z_val", [
+        (100.0, 1.0),   # quantum regime  (Te = 100 eV > 27·1² = 27 eV)
+        (5.0,   1.0),   # classical regime*  (Te = 5 eV < 27 eV)
+        (10.0,  1.0),   # classical regime*  (Te = 10 eV < 27 eV)
+        (100.0, 4.0),   # classical regime*  (Te = 100 eV < 27·4² = 432 eV)
+        (200.0, 6.0),   # classical regime*  (Te = 200 eV < 27·6² = 972 eV)
+    ])
+    def test_kappa_matches_correct_coulomb_log(self, Te_eV, Z_val):
+        """kappa_inv_brems must agree with the reference (correct b_min) formula."""
+        ne_val = 1e25   # m^-3 — underdense
+        omega  = 2 * np.pi * c / 1064e-9
+
+        kappa_ref = self._reference_kappa(ne_val, Te_eV, Z_val, omega)
+        kappa_got = float(kappa_inv_brems(
+            jnp.float32(ne_val), jnp.float32(Te_eV), float(Z_val), omega))
+
+        np.testing.assert_allclose(
+            kappa_got, kappa_ref, rtol=1e-4,
+            err_msg=(
+                f"Te={Te_eV} eV, Z={Z_val}: kappa={kappa_got:.6g}, "
+                f"expected={kappa_ref:.6g}. "
+                f"Check that b_classical = Ze/(4πε₀·Te) is used when it exceeds b_quantum."
+            ),
+        )
+
+    def test_classical_regime_gives_lower_kappa_than_buggy(self):
+        """
+        In the classical regime (b_classical > b_quantum), using the correct
+        b_classical (larger) increases b_min and therefore REDUCES the Coulomb log
+        and kappa relative to the buggy implementation that always used b_quantum.
+
+        This verifies the direction of the fix: the corrected kappa must be
+        ≤ the buggy kappa in the classical-dominated regime.
+        """
+        from scipy.constants import e as e_charge, epsilon_0 as eps0
+        # Cold plasma, Z=4: clearly in classical regime
+        Te_eV  = 10.0
+        Z_val  = 4.0
+        ne_val = 1e25
+        omega  = 2 * np.pi * c / 1064e-9
+
+        # Compute CL with correct b_classical
+        ne_cc = ne_val * 1e-6
+        v_the = 4.19e5 * np.sqrt(Te_eV)
+        o_pe  = 5.64e4 * np.sqrt(ne_cc)
+        o_max = max(o_pe, omega)
+        b_classical_correct = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
+        b_classical_buggy   = Z_val * e_charge / Te_eV       # missing 1/(4πε₀)
+        b_quantum           = 2.760428269727312e-10 / np.sqrt(Te_eV)
+
+        CL_correct = max(2.0, np.log(v_the / (o_max * max(b_classical_correct, b_quantum))))
+        CL_buggy   = max(2.0, np.log(v_the / (o_max * max(b_classical_buggy,   b_quantum))))
+
+        assert b_classical_correct > b_quantum, (
+            "Test setup error: b_classical_correct should exceed b_quantum here."
+        )
+        assert CL_correct < CL_buggy, (
+            f"CL_correct ({CL_correct:.4f}) should be < CL_buggy ({CL_buggy:.4f}) "
+            f"because larger b_min → smaller argument of log."
+        )
+
+        # The actual kappa_inv_brems must match the corrected value
+        kappa_correct = 3.1e-5 * Z_val * c * (ne_cc/omega)**2 * CL_correct * Te_eV**(-1.5)
+        kappa_got     = float(kappa_inv_brems(
+            jnp.float32(ne_val), jnp.float32(Te_eV), float(Z_val), omega))
+
+        np.testing.assert_allclose(
+            kappa_got, kappa_correct, rtol=1e-4,
+            err_msg=(
+                f"Te={Te_eV} eV, Z={Z_val}: kappa={kappa_got:.6g} should equal "
+                f"corrected value {kappa_correct:.6g} (not buggy {3.1e-5*Z_val*c*(ne_cc/omega)**2*CL_buggy*Te_eV**(-1.5):.6g})."
+            ),
         )
