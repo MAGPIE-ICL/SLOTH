@@ -1,24 +1,26 @@
-name: CI
+name: CI – physics and benchmark tests
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
-    branches: [main]
-
-permissions:
-  contents: read
+    branches: ["**"]
 
 jobs:
   test:
+    name: Run tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -31,4 +33,4 @@ jobs:
           pip install -e ".[test]"
 
       - name: Run tests
-        run: pytest -v
+        run: pytest -v --tb=short

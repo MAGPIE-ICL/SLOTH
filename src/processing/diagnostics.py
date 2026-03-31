@@ -253,6 +253,13 @@ class Shadowgraphy(Diagnostic):
     Implements a two lens telescope with M = 1 and a single lens system with M = 2. Both lenses have a f = L/2 focal length, where L is a length scale specified when the class is initialized.
     Each optic has a radius R, which is used to reject rays outside the numerical aperture of the optical system.
     """
+    def single_lens_custom_solve(self, f = 200, obj_dist = 400, img_dist = 400):
+        ## single lens - M = Variable (around ~2) (based on Detector position. Real experimental setup)
+        r1 = travel(self.r0, obj_dist - self.focal_plane) #displace rays to lens. Accounts for object with depth
+        r2 = circular_aperture(r1, self.R)      # cut off
+        r3 = sym_lens(r2, f)             # lens 1
+        r4 = travel(r3, img_dist)           # detector
+        self.rf = r4
 
     def single_lens_solve(self):
         ## single lens - M = Variable (around ~2) (based on Detector position. Real experimental setup)
@@ -332,6 +339,21 @@ class Refractometry(Diagnostic):
     Implements a spherical lens with focal length f1 = L/2 and M = 2 for the spatial axis and a cylindrical lens
     with focal length f1 and f2.
     """
+    def incoherent_custom_solve(self, f1 = 200, f3 = 200, img_f1_dist = 600, img_dist = 400):
+        ##
+        ## Is there an efficient way to chain these so needlessly variables are not used without having 1 really long line
+        ##
+
+        ## Imaging the spatial axis
+        r1 = travel(self.r0, 2*f1 - self.focal_plane) #displace rays to lens 1. Accounts for object with depth
+        r2 = circular_aperture(r1, self.R)   # cut off
+        r3 = sym_lens(r2, f1)                # lens 1 - spherical
+        r4 = travel(r3, img_f1_dist)         # displace rays to lens 2 - hybrid
+        r5 = rect_aperture(r4, 15, 30)       # rectangular lens cut-off
+        r6 = circular_aperture(r5, self.R)   # cut off
+        r7 = lens(r6, (2*f3)/3, f1)          # lens 2 - hybrid lens
+        r8 = travel(r7, img_dist)               # displace rays to detector
+        self.rf = r8
 
     def incoherent_solve(self):
         ##

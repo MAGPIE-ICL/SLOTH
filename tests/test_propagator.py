@@ -24,7 +24,7 @@ import numpy as np
 import jax.numpy as jnp
 import scipy.constants as sc
 
-from core.propagator import dndr
+from core.propagator import Propagator
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ class TestUniformDensity:
             [-0.5, 0.4, -0.3],
         ])
 
-        grad = dndr(r, gt, x, y, z)
+        grad = Propagator.dndr(r, gt, x, y, z)
 
         np.testing.assert_allclose(grad, 0.0, atol=1e-10*n_cr)
 
@@ -167,7 +167,7 @@ class TestLinearDensity:
             rng.uniform(-0.6, 0.6, N),
         ]))
 
-        grad = dndr(r, gt, x, y, z)
+        grad = Propagator.dndr(r, gt, x, y, z)
 
         np.testing.assert_allclose(grad[0, :], expected_gx, atol=1e-8*n_cr, rtol=1e-4)
         np.testing.assert_allclose(grad[1, :], expected_gy, atol=1e-8*n_cr, rtol=1e-4)
@@ -199,7 +199,7 @@ class TestQuadraticDensity:
             jnp.zeros_like(y_query),
         ], axis=-1)
 
-        grad = dndr(r, gt, x, y, z)
+        grad = Propagator.dndr(r, gt, x, y, z)
 
         expected_gy = prefactor * 2.0 * n0 * y_query
         np.testing.assert_allclose(grad[0, :], 0.0, atol=1e-8*n_cr)
@@ -223,7 +223,7 @@ class TestQuadraticDensity:
             jnp.zeros_like(x_query),
         ], axis=-1)
 
-        grad = dndr(r, gt, x, y, z)
+        grad = Propagator.dndr(r, gt, x, y, z)
 
         expected_gx = prefactor * 2.0 * n0 * x_query
         np.testing.assert_allclose(grad[0, :], expected_gx, atol=1e-8*n_cr, rtol=1e-4)
@@ -257,7 +257,7 @@ class TestExponentialDensity:
             jnp.zeros_like(x_query),
         ], axis=-1)
 
-        grad = dndr(r, gt, x, y, z)
+        grad = Propagator.dndr(r, gt, x, y, z)
 
         expected_gx = prefactor * n0 * k * jnp.exp(k * x_query)
         np.testing.assert_allclose(grad[0, :], expected_gx, atol=1e-8*n_cr, rtol=1e-4)
@@ -296,7 +296,7 @@ class TestSeparableProduct:
             [-0.1, 0.2, -0.15],
         ])
 
-        grad = dndr(r, gt, x, y, z)
+        grad = Propagator.dndr(r, gt, x, y, z)
 
         for i in range(r.shape[0]):
             xq, yq, zq = r[i]
@@ -329,8 +329,8 @@ class TestSymmetry:
         r_pos = jnp.array([[0.3, 0.0, 0.0]])
         r_neg = jnp.array([[-0.3, 0.0, 0.0]])
 
-        grad_pos = dndr(r_pos, gt, x, y, z)
-        grad_neg = dndr(r_neg, gt, x, y, z)
+        grad_pos = Propagator.dndr(r_pos, gt, x, y, z)
+        grad_neg = Propagator.dndr(r_neg, gt, x, y, z)
 
         # x-gradient should be the same constant at both points
         np.testing.assert_allclose(grad_pos[0, 0], grad_neg[0, 0], rtol=1e-4)
@@ -362,8 +362,8 @@ class TestOmegaScaling:
 
         r = jnp.array([[0.0, 0.0, 0.0]])
 
-        grad1 = dndr(r, gt1, x, y, z)
-        grad2 = dndr(r, gt2, x, y, z)
+        grad1 = Propagator.dndr(r, gt1, x, y, z)
+        grad2 = Propagator.dndr(r, gt2, x, y, z)
 
         # gradient scales as 1/ncr ∝ 1/omega^2, so 4x reduction
         np.testing.assert_allclose(grad2, grad1 / 4.0, rtol=1e-6)

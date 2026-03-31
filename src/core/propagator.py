@@ -14,6 +14,7 @@ from sys import getsizeof as getsizeof_default
 from diffrax import Solution
 
 import scipy.constants as sc
+from scipy.constants import c
 from jax.scipy.interpolate import RegularGridInterpolator
 from shared.utils import getsizeof
 from shared.utils import mem_conversion
@@ -220,7 +221,8 @@ class Propagator(eqx.Module):
 
 
 ##
-## Helper functions for calculations (kept as module-level for backward compat)
+## Legacy module-level functions (kept for backward compat with
+## trace_and_save_depths, solve, and existing tests)
 ##
 
 def omega_pe(ne):
@@ -231,32 +233,136 @@ def omega_pe(ne):
 def n_refrac(ne, omega):
     return Propagator.n_refrac(ne, omega)
 
-def dndr(r, gradient_term, x, y, z):
+
+def precompute_gradients(ne, x, y, z, omega):
     """
-    Returns the gradient at the locations r
+    Pre-compute the spatial gradients of the refractive-index driving term once,
+    before the ODE solve.  Passing the resulting arrays into the ODE function
+    avoids repeating the full-grid ``jnp.gradient`` calls at every adaptive
+    time step.
+
+    The driving term is::
+
+        gradient_term = -0.5 * c² * ne / (3.14207787e-4 * ω²)
+
+    where ``3.14207787e-4 = mₑ ε₀ / e²`` (SI).
 
     Args:
-        r (3xN float): N [x, y, z] locations
+        ne    (jax.Array): Electron density grid **in m⁻³**, shape ``(Nx, Ny, Nz)``.
+        x, y, z (jax.Array): 1-D coordinate arrays in metres.
+        omega (float): Laser angular frequency in rad/s.
 
     Returns:
-        3 x N float: N [dx, dy, dz] electron density gradients
+        tuple: ``(dndx, dndy, dndz)`` — each a ``(Nx, Ny, Nz)`` JAX array.
     """
-    return Propagator.dndr(r, gradient_term, x, y, z)
+    ncr = 3.14207787e-4 * float(omega) ** 2
+    ne_max = float(jnp.max(ne))
+    if ne_max >= ncr:
+        import warnings
+        warnings.warn(
+            f"precompute_gradients: {ne_max:.3g} m⁻³ cells at or above critical "
+            f"density ncr = {ncr:.3g} m⁻³ (ne/ncr = {ne_max/ncr:.2g}).  "
+            "This causes large gradient magnitudes that prevent ODE convergence.  "
+            "Check that ne is in m⁻³ (not cm⁻³ — convert with ne_cc * 1e6) and "
+            "that your domain does not include over-critical cells.",
+            stacklevel=2,
+        )
 
-# ODEs of photon paths, standalone function to support the solve()
-def dsdt(t, s, parallelise, n, x, y, z, lengths, dims):
+    coeff = np.float64(-0.5) * float(c) ** 2 / (3.14207787e-4 * float(omega) ** 2)
+    gradient_term = ne * ne.dtype.type(coeff)
+    dndx = jnp.gradient(gradient_term, x, axis=0)
+    dndy = jnp.gradient(gradient_term, y, axis=1)
+    dndz = jnp.gradient(gradient_term, z, axis=2)
+    return dndx, dndy, dndz
+
+
+def dndr(r, dndx, dndy, dndz, x, y, z):
     """
-    Returns an array with the gradients and velocity per ray for ode_int
+    Returns the gradient of the refractive-index driving term at the ray
+    positions *r* by trilinear interpolation of the pre-computed gradient grids.
 
     Args:
-        t (float array): I think this is a dummy variable for ode_int - our problem is time invarient
-        s (6N float array): flattened 6xN array of rays used by ode_int
-        ScalarDomain (ScalarDomain): an ScalarDomain object which can calculate gradients
+        r (jax.Array): Shape ``(N, 3)`` — N ray positions ``[x, y, z]``.
+        dndx, dndy, dndz (jax.Array): Pre-computed gradient grids of shape
+            ``(Nx, Ny, Nz)``, produced by :func:`precompute_gradients`.
+        x, y, z (jax.Array): 1-D coordinate arrays in metres.
 
     Returns:
-        6N float array: flattened array for ode_int
+        jax.Array: Shape ``(3, N)`` — gradient components at each ray position.
     """
-    return Propagator.dsdt(t, s, parallelise, n, x, y, z, lengths, dims)
+    grad = jnp.zeros_like(r.T)
+    grad = grad.at[0, :].set(trilinearInterpolator((x, y, z), dndx, r, fill_value=0.0))
+    grad = grad.at[1, :].set(trilinearInterpolator((x, y, z), dndy, r, fill_value=0.0))
+    grad = grad.at[2, :].set(trilinearInterpolator((x, y, z), dndz, r, fill_value=0.0))
+    return grad
+
+
+def kappa_inv_brems(ne, Te, Z, omega):
+    """
+    Compute the inverse bremsstrahlung amplitude absorption rate [1/s] at each
+    grid point using the NRL formulary (NRL Plasma Formulary, p.58).
+
+    Args:
+        ne  (jax.Array or float): Electron density in m⁻³.
+        Te  (jax.Array or float): Electron temperature in eV.
+        Z   (jax.Array or float): Mean ion charge state (dimensionless).
+        omega (float): Laser angular frequency in rad/s.
+
+    Returns:
+        jax.Array: Amplitude absorption rate with the same shape as *ne*, units of 1/s.
+    """
+    from scipy.constants import e as e_charge, epsilon_0
+
+    ne_cc = ne * 1e-6
+    v_the = 4.19e5 * jnp.sqrt(Te)
+    o_pe = 5.64e4 * jnp.sqrt(ne_cc)
+    o_max = jnp.maximum(o_pe, omega)
+    b_min = Z * e_charge / (4.0 * np.pi * epsilon_0 * Te)
+    CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * b_min)))
+    return 3.1e-5 * Z * c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
+
+
+def dsdt(t, s, parallelise, dndx, dndy, dndz, x, y, z, lengths, dims, kappa=None):
+    """
+    Returns an array with the gradients and velocity per ray for ode_int.
+
+    Accepts pre-computed gradient grids ``dndx``, ``dndy``, ``dndz`` (produced
+    by :func:`precompute_gradients`).  When *kappa* is provided, state element 6
+    tracks accumulated optical depth τ (amplitude = exp(-τ)).
+
+    Args:
+        t (float): Dummy time variable (problem is time-invariant).
+        s (jax.Array): Flattened 6N (or 7N) state vector.
+        parallelise (bool): True for vmap path (one ray per call).
+        dndx, dndy, dndz (jax.Array): Pre-computed gradient grids.
+        x, y, z (jax.Array): 1-D coordinate arrays in metres.
+        lengths, dims (jax.Array): Domain size / resolution (legacy compat).
+        kappa (jax.Array or None): Inv-brems absorption rate grid [1/s].
+
+    Returns:
+        jax.Array: Flattened 6N (or 7N) derivative array.
+    """
+    nstate = 7 if kappa is not None else 6
+
+    if not parallelise:
+        s = jnp.reshape(s, (nstate, s.size // nstate))
+    else:
+        s = jnp.reshape(s, (nstate, 1))
+
+    sprime = jnp.zeros_like(s)
+
+    r = s[:3, :].T
+    v = s[3:6, :]
+    del s
+
+    sprime = sprime.at[3:6, :].set(dndr(r, dndx, dndy, dndz, x, y, z))
+    sprime = sprime.at[:3, :].set(v)
+
+    if kappa is not None:
+        kappa_at_r = trilinearInterpolator((x, y, z), kappa, r, fill_value=0.0)
+        sprime = sprime.at[6, :].set(kappa_at_r)
+
+    return jnp.ravel(sprime)
    
 def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose):
     """
@@ -821,3 +927,318 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
     else:
         print("\nData output as a hdf4.tar.gz file due to limitations of vram/ram space.")
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")
+def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
+                          lwl=1064e-9, jones_components=None, jitted=True,
+                          rtol=1e-3, atol=1e-5, verbose=True):
+    """
+    Trace rays through the domain and save the Jones vector at uniformly-spaced
+    depths along the propagation direction, then pickle the results.
+
+    Works for any probing direction ('x', 'y', or 'z'); the direction is read
+    from ``ScalarDomain.probing_direction``.
+
+    The Jones vector at each depth is a 4-row array::
+
+        row 0 – transverse position along the first  transverse axis
+        row 1 – angle        along the first  transverse axis
+        row 2 – transverse position along the second transverse axis
+        row 3 – angle        along the second transverse axis
+
+    The mapping between rows and physical axes depends on the probing direction:
+
+    ==================  =======  =======  =======  =======
+    probing_direction   row 0    row 1    row 2    row 3
+    ==================  =======  =======  =======  =======
+    'z'                 x        φ_x      y        φ_y
+    'y'                 x        φ_x      z        φ_z
+    'x'                 y        φ_y      z        φ_z
+    ==================  =======  =======  =======  =======
+
+    Args:
+        beam (jax.Array or tuple): Either
+
+            * a ``(6, N)`` array of pre-created rays with rows
+              ``(x, y, z, vx, vy, vz)``; or
+            * a tuple ``(beam_size, divergence, ne_extent, probing_direction,
+              beam_type, seeded)`` whose elements are passed directly to
+              ``core.beam.Beam``.  When a tuple is supplied the number of rays
+              is taken from ``ScalarDomain.Np_total``, which must be set.
+
+        ScalarDomain (core.domain.ScalarDomain): Domain object. Its extent in the probing
+            direction must be >= depth_max.  When *beam* is a tuple,
+            ``ScalarDomain.Np_total`` must be set to the desired number of rays.
+        step (float): Cadence of depth saves, in metres (e.g. 200e-6 for 200 µm).
+        depth_max (float): Maximum propagation depth to record, in metres (e.g. 1e-3 for 1 mm).
+            The domain length in the probing direction must be >= depth_max.
+        output_path (str or None): File path for the output pickle. Pass None to skip
+            writing the file (results are still returned).
+        lwl (float): Laser wavelength in metres (default 1064e-9). Used to compute
+            the angular frequency ``omega = 2π·c/lwl``.
+        jones_components: Selects which rows of the Jones vector to save.
+            Accepted values:
+
+            * ``None`` or ``'all'``  – save all four rows (default).
+            * ``'position'``         – save rows 0 and 2 (transverse positions only).
+            * ``'angle'``            – save rows 1 and 3 (angles only).
+            * list / tuple of ints  – save the specified row indices, e.g. ``[0, 1]``.
+
+        jitted (bool): Whether to JIT-compile the ODE solver (default True).
+        rtol (float): Relative ODE tolerance (default 1e-3).
+        atol (float): Absolute ODE tolerance (default 1e-5).
+        verbose (bool): Print progress information (default True).
+
+    Returns:
+        dict: Keys:
+            ``depth_saves``         – 1-D numpy array of depth positions along the
+                                      probing axis (metres).
+            ``jvec``                – list of ``(n_components, N)`` numpy arrays; the
+                                      selected Jones-vector rows at each depth.  When
+                                      ``ScalarDomain.inv_brems=True`` each column is
+                                      multiplied by the corresponding per-ray amplitude
+                                      so attenuation is already baked in.
+            ``jones_components``    – list of int indices recording which rows were saved.
+            ``amplitude``           – *(only when inv_brems=True)* list of ``(N,)`` numpy
+                                      arrays containing the per-ray amplitude ``exp(-τ)``
+                                      at each depth snapshot, where τ is the accumulated
+                                      inverse-bremsstrahlung optical depth.
+            ``jvec_unweighted``     – *(only when inv_brems=True)* list of
+                                      ``(n_components, N)`` numpy arrays; the geometric
+                                      Jones vector **before** amplitude weighting, useful
+                                      for sanity-checking the attenuation.
+
+    Raises:
+        ValueError: If the domain length in the probing direction is smaller than depth_max.
+        ValueError: If step is not positive or depth_max <= 0.
+        ValueError: If jones_components contains an index outside [0, 3].
+
+    Example (tuple beam)::
+
+        import core.domain as d
+        import core.propagator as p
+
+        # --- parameters ---
+        lwl               = 1064e-9          # laser wavelength (m)
+        probing_direction = 'z'
+        Np                = int(1e5)
+
+        # --- domain (Np stored here, not in the beam tuple) ---
+        domain = d.ScalarDomain(
+            lengths, dims,
+            leeway_factor     = 3,
+            ne_type           = "import",
+            probing_direction = probing_direction,
+            Np                = Np,
+            ne                = ne.v * 1e6,  # electron density in m⁻³
+        )
+
+        # --- trace and save Jones vector every 200 µm up to 1 mm ---
+        result = p.trace_and_save_depths(
+            (500e-6, 0.1e-3, probing_extent, probing_direction, "circular", False),
+            domain,
+            step       = 200e-6,            # save cadence (m)
+            depth_max  = 1e-3,              # maximum depth (m)
+            output_path= "depth_saves.pkl", # set to None to skip file write
+            lwl        = lwl,
+            jones_components = 'position',  # save transverse positions only
+            verbose    = True,
+        )
+
+        # result['depth_saves']  – 1-D array of save depths (m)
+        # result['jvec']         – list of (2, Np) arrays at each depth
+        # result['jones_components'] – [0, 2]  (rows saved)
+
+        depth_mm = result['depth_saves'] * 1e3
+        for depth, jv in zip(depth_mm, result['jvec']):
+            x_pos = jv[0]          # transverse x at this depth (m)
+            y_pos = jv[1]          # transverse y at this depth (m)
+            print(f"depth={depth:.2f} mm  <x>={x_pos.mean()*1e3:.3f} mm")
+    """
+
+    import pickle
+
+    omega = 2 * np.pi * (c / lwl)
+
+    # ── Resolve beam: accept either a pre-built (6, N) ray array or a compact
+    # parameter tuple (beam_size, divergence, ne_extent, probing_direction,
+    # beam_type, seeded).  When a tuple is supplied the number of rays is read
+    # from ScalarDomain.Np_total so that Np does not need to appear in the
+    # tuple, consistent with how solve() works.
+    if isinstance(beam, tuple):
+        from core.beam import Beam
+        assert getattr(ScalarDomain, 'Np_total', None) is not None, (
+            "\nScalarDomain.Np_total must be set when passing beam as a tuple. "
+            "Pass Np=<number_of_rays> to ScalarDomain(...)."
+        )
+        s0 = Beam(
+            ScalarDomain.Np_total,
+            beam_size         = beam[0],
+            divergence        = beam[1],
+            ne_extent         = beam[2],
+            probing_direction = beam[3],
+            beam_type         = beam[4],
+            seeded            = beam[5],
+        ).s0
+    else:
+        s0 = beam
+
+    if step <= 0 or depth_max <= 0:
+        raise ValueError("step and depth_max must be positive.")
+
+    # ── Parse jones_components ────────────────────────────────────────────────
+    if jones_components is None or jones_components == 'all':
+        comp_indices = [0, 1, 2, 3]
+    elif jones_components == 'position':
+        comp_indices = [0, 2]
+    elif jones_components == 'angle':
+        comp_indices = [1, 3]
+    else:
+        comp_indices = list(jones_components)
+        invalid = [i for i in comp_indices if i not in (0, 1, 2, 3)]
+        if invalid:
+            raise ValueError(
+                f"jones_components indices {invalid} are out of range. "
+                f"Valid indices are 0, 1, 2, 3."
+            )
+
+    probing_direction = ScalarDomain.probing_direction
+    dir_idx = ['x', 'y', 'z'].index(probing_direction)
+    trace_depth = float(ScalarDomain.lengths[dir_idx])
+
+    if trace_depth < depth_max:
+        raise ValueError(
+            f"Domain length in probing direction '{probing_direction}' ({trace_depth:.6g} m) "
+            f"is smaller than the requested depth_max ({depth_max:.6g} m). "
+            f"Increase the domain size to at least depth_max."
+        )
+
+    # Uniform depth save positions: [0, step, 2*step, ..., depth_max]
+    n_saves = int(np.round(depth_max / step)) + 1
+    depth_saves = np.linspace(0.0, depth_max, n_saves)
+
+    # ── Inverse bremsstrahlung ────────────────────────────────────────────────
+    inv_brems = getattr(ScalarDomain, 'inv_brems', False)
+    kappa = None
+    if inv_brems:
+        kappa = kappa_inv_brems(
+            ScalarDomain.ne,
+            ScalarDomain.Te,
+            ScalarDomain.Z,
+            omega,
+        )
+
+    if verbose:
+        print(f"\ntrace_and_save_depths: saving at {n_saves} depth(s) from 0 to {depth_max*1e3:.4g} mm "
+              f"(step = {step*1e6:.4g} µm, probing direction = '{probing_direction}', "
+              f"jones_components = {comp_indices}, inv_brems = {inv_brems}).")
+
+    # Map depth positions to normalised diffrax time [0, 1].
+    # The ODE solver normalises real time by norm_factor = sqrt(8)*trace_depth/c so
+    # that t_norm=1 corresponds to the end of the trace.  A ray travelling at ~c
+    # covers depth d in real time d/c, giving normalised time d/(sqrt(8)*trace_depth).
+    norm_factor = np.sqrt(8.0) * trace_depth / c
+    t_saves_norm = depth_saves / (np.sqrt(8.0) * trace_depth)
+
+    Np = s0.shape[1]
+
+    # Pre-compute gradient grids once here so the ODE body only does
+    # trilinear interpolation at each adaptive step, not full-grid
+    # jnp.gradient calls.
+    dndx, dndy, dndz = precompute_gradients(
+        ScalarDomain.ne,
+        ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
+        omega,
+    )
+
+    args = (
+        True,  # parallelise=True (each vmap'd call handles one ray)
+        dndx, dndy, dndz,
+        ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
+        ScalarDomain.lengths, ScalarDomain.dims,
+        kappa,
+    )
+
+    def dsdt_ODE(t, y, args):
+        return dsdt(t, y, *args) * norm_factor
+
+    from diffrax import ODETerm, Tsit5, SaveAt, PIDController, diffeqsolve
+
+    term = ODETerm(dsdt_ODE)
+    solver = Tsit5()
+    saveat = SaveAt(ts=jnp.array(t_saves_norm))
+    stepsize_controller = PIDController(rtol=rtol, atol=atol)
+
+    def _ode_solve(s0_ray, args):
+        return diffeqsolve(
+            term,
+            solver,
+            y0=jnp.array(s0_ray),
+            args=args,
+            t0=float(t_saves_norm[0]),
+            t1=float(t_saves_norm[-1]),
+            dt0=None,
+            saveat=saveat,
+            stepsize_controller=stepsize_controller,
+            max_steps=int(2e8),
+        )
+
+    if jitted:
+        from equinox import filter_jit
+        _ode_solve = filter_jit(_ode_solve)
+
+    # When inv_brems is enabled, append an optical-depth column (0.0) to each
+    # ray so the state vector is (7,) per ray.  State[6] accumulates
+    # τ = ∫κ dt; amplitude is recovered as exp(-τ) at output.
+    if inv_brems:
+        tau_init = jnp.zeros((Np, 1), dtype=s0.dtype)
+        s0_T = jnp.concatenate([s0.T, tau_init], axis=1)  # shape (N, 7)
+    else:
+        s0_T = s0.T  # shape (N, 6)
+
+    sol = jax.block_until_ready(
+        jax.vmap(_ode_solve, in_axes=(0, None))(s0_T, args)
+    )
+
+    # sol.ys has shape (N, n_saves, 6) [or (N, n_saves, 7) with inv_brems].
+    # For each depth snapshot: compute the full 4-row Jones vector via
+    # ray_to_Jonesvector (keep_current_plane=True records the actual position
+    # and angle at that depth, not propagated to the exit plane), then keep
+    # only the user-requested rows.
+    # When inv_brems is active the per-ray amplitude is also extracted and used
+    # to weight the Jones vector so that attenuation is baked into jvec.  The
+    # unweighted geometric Jones vector is preserved in jvec_unweighted for
+    # sanity-checking.
+    jvec_list            = []
+    jvec_unweighted_list = [] if inv_brems else None
+    amp_list             = [] if inv_brems else None
+
+    for j in range(n_saves):
+        rays_j = sol.ys[:, j, :6].T  # shape (6, N)  — rows 0-5 always
+        jvec_full, _ = ray_to_Jonesvector(rays_j, keep_current_plane=True,
+                                           probing_direction=probing_direction)
+        # jvec_full rows: [pos_axis1, angle_axis1, pos_axis2, angle_axis2]
+        jvec_unweighted = np.asarray(jvec_full)[comp_indices, :]  # (n_comp, N)
+
+        if inv_brems:
+            amp_j = np.asarray(np.exp(-sol.ys[:, j, 6]))  # a = exp(-τ)
+            amp_list.append(amp_j)
+            jvec_list.append(jvec_unweighted * amp_j[np.newaxis, :])
+            jvec_unweighted_list.append(jvec_unweighted)
+        else:
+            jvec_list.append(jvec_unweighted)
+
+    result = {
+        'depth_saves': depth_saves,
+        'jvec': jvec_list,
+        'jones_components': comp_indices,
+    }
+    if inv_brems:
+        result['amplitude']        = amp_list
+        result['jvec_unweighted']  = jvec_unweighted_list
+
+    if output_path is not None:
+        with open(output_path, 'wb') as fh:
+            pickle.dump(result, fh)
+        if verbose:
+            print(f"trace_and_save_depths: results saved to '{output_path}'.")
+
+    return result
