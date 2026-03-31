@@ -4,6 +4,8 @@ import numpy as np
 
 import os
 
+import equinox as eqx
+
 from scipy.integrate import odeint, solve_ivp
 from time import time
 from sys import getsizeof as getsizeof_default
@@ -11,8 +13,8 @@ from sys import getsizeof as getsizeof_default
 # object type of diffrax output
 from diffrax import Solution
 
+import scipy.constants as sc
 from scipy.constants import c
-from scipy.constants import e
 from jax.scipy.interpolate import RegularGridInterpolator
 from shared.utils import getsizeof
 from shared.utils import mem_conversion
@@ -24,17 +26,213 @@ from core.interpolator import RegularGridInterpolator as trilinearInterpolator
 from shared.propagation import ray_to_Jonesvector
 from shared.propagation import back_propogate
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Propagator – eqx.Module class-based solver
+# ──────────────────────────────────────────────────────────────────────
+
+class Propagator(eqx.Module):
+    """Equinox module wrapping the diffrax ray-trace solver.
+
+    Stores the refractive-index field, grid coordinates, and all solver
+    parameters as JAX-compatible fields so the entire object can be
+    passed through ``jax.jit`` / ``jax.vmap`` without issues.
+
+    Usage::
+
+        domain = Domain.from_ne(ne, x, y, z, lengths, dims, lwl=351e-9)
+        prop   = Propagator(domain, probing_depth=0.10)
+        sol    = prop(s0)          # s0 shape: (6, Np)
+        # sol.ys has shape (Np, save_points, 6)
+    """
+
+    # Domain fields
+    n: jax.Array
+    x: jax.Array
+    y: jax.Array
+    z: jax.Array
+    lengths: jax.Array
+    dims: jax.Array
+
+    # Physical / solver scalars
+    norm_factor: float
+    rtol: float
+    atol: float
+    save_points: int
+    max_steps: int
+
+    def __init__(self, domain, probing_depth, *,
+                 save_points=2, rtol=1e-3, atol=1e-5, max_steps=int(2e8)):
+        """
+        Args:
+            domain: A Domain (must expose .n, .x, .y, .z, .lengths, .dims).
+            probing_depth (float): Physical depth to trace (metres).
+            save_points (int): Number of time-slices to save (≥2).
+            rtol (float): Relative tolerance for adaptive stepper.
+            atol (float): Absolute tolerance for adaptive stepper.
+            max_steps (int): Maximum number of integration steps.
+        """
+        self.n = domain.n
+        self.x = domain.x
+        self.y = domain.y
+        self.z = domain.z
+        self.lengths = domain.lengths
+        self.dims = domain.dims
+
+        # sqrt(8) safety factor so rays have time to exit the box
+        t_end = jnp.sqrt(8.0) * probing_depth / sc.c
+        self.norm_factor = float(t_end)
+
+        self.rtol = rtol
+        self.atol = atol
+        self.save_points = save_points
+        self.max_steps = max_steps
+
+    # ── static helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def omega_pe(ne):
+        """Electron plasma frequency (rad/s).  NRL formulary p 28."""
+        return 5.64e4 * jnp.sqrt(ne)
+
+    @staticmethod
+    def n_refrac(ne, omega):
+        """Plasma refractive index."""
+        return jnp.sqrt(1.0 - (Propagator.omega_pe(ne * 1e-6) / omega) ** 2)
+
+    @staticmethod
+    def dndr(r, gradient_term, x, y, z):
+        """Gradient of the refractive-index term at positions *r*.
+
+        Args:
+            r: (N, 3) position array.
+            gradient_term: 3-D array where each element is 0.5·c²·n²,
+                used for computing the spatial gradient that drives
+                ray deflection.
+            x, y, z: 1-D coordinate arrays of the domain grid.
+
+        Returns:
+            (3, N) gradient array.
+        """
+        grad = jnp.zeros_like(r.T)
+
+        dndx = jnp.gradient(gradient_term, x, axis=0)
+        grad = grad.at[0, :].set(trilinearInterpolator((x, y, z), dndx, r, fill_value=0.0))
+        del dndx
+
+        dndy = jnp.gradient(gradient_term, y, axis=1)
+        grad = grad.at[1, :].set(trilinearInterpolator((x, y, z), dndy, r, fill_value=0.0))
+        del dndy
+
+        dndz = jnp.gradient(gradient_term, z, axis=2)
+        grad = grad.at[2, :].set(trilinearInterpolator((x, y, z), dndz, r, fill_value=0.0))
+        del dndz
+
+        return grad
+
+    @staticmethod
+    def dsdt(t, s, parallelise, n, x, y, z, lengths, dims):
+        """ODE right-hand side for photon ray equations.
+
+        Args:
+            t: time (unused — the problem is time-invariant).
+            s: flattened 6×N state vector (or 6-vector when parallelised).
+            parallelise: if True, reshape to (6, 1) for the vmap path.
+            n, x, y, z: refractive-index field and grid coordinates.
+            lengths, dims: domain size / resolution (unused inside, kept for
+                           interface compatibility with the legacy solver).
+
+        Returns:
+            Flattened derivative vector matching *s*.
+        """
+        if not parallelise:
+            s = jnp.reshape(s, (6, s.size // 6))
+        else:
+            s = jnp.reshape(s, (6, 1))
+
+        sprime = jnp.zeros_like(s)
+
+        r = s[:3, :].T
+        v = s[3:6, :]
+        del s
+
+        gradient_term = 0.5 * sc.c ** 2 * n ** 2
+
+        sprime = sprime.at[3:6, :].set(Propagator.dndr(r, gradient_term, x, y, z))
+        sprime = sprime.at[:3, :].set(v)
+
+        return jnp.ravel(sprime)
+
+    # ── __call__  (replaces solve_minimal) ────────────────────────────
+
+    def __call__(self, s0):
+        """Propagate rays through the domain.
+
+        Args:
+            s0 (jax.Array): Initial state matrix of shape (6, Np).
+                             Rows 0-2 are position (x, y, z), rows 3-5 velocity.
+
+        Returns:
+            diffrax.Solution whose ``.ys`` has shape (Np, save_points, 6).
+        """
+        from diffrax import ODETerm, Tsit5, SaveAt, PIDController, diffeqsolve
+        from equinox import filter_jit
+
+        args = (
+            True,           # parallelise (always True for vmap path)
+            self.n,
+            self.x, self.y, self.z,
+            self.lengths, self.dims,
+        )
+
+        norm_factor = self.norm_factor
+
+        def dsdt_normed(t, y, args):
+            return Propagator.dsdt(t, y, *args) * norm_factor
+
+        term = ODETerm(dsdt_normed)
+        solver = Tsit5()
+        saveat = SaveAt(ts=jnp.linspace(0.0, 1.0, self.save_points))
+        stepsize_controller = PIDController(rtol=self.rtol, atol=self.atol)
+
+        max_steps = self.max_steps
+
+        def _solve_single(s0_single, args):
+            return diffeqsolve(
+                term,
+                solver,
+                y0=jnp.array(s0_single),
+                args=args,
+                t0=0.0,
+                t1=1.0,
+                dt0=None,
+                saveat=saveat,
+                stepsize_controller=stepsize_controller,
+                max_steps=max_steps,
+            )
+
+        _solve_jit = filter_jit(_solve_single)
+
+        sol = jax.block_until_ready(
+            jax.vmap(_solve_jit, in_axes=(0, None))(s0.T, args)
+        )
+
+        return sol
+
+
 ##
-## Helper functions for calculations
+## Legacy module-level functions (kept for backward compat with
+## trace_and_save_depths, solve, and existing tests)
 ##
 
 def omega_pe(ne):
     """Calculate electron plasma freq. Output units are rad/sec. From nrl pp 28"""
-    return 5.64e4 * jnp.sqrt(ne)
+    return Propagator.omega_pe(ne)
 
 # Plasma refractive index
 def n_refrac(ne, omega):
-    return jnp.sqrt(1.0 - (omega_pe(ne * 1e-6) / omega) ** 2)
+    return Propagator.n_refrac(ne, omega)
+
 
 def precompute_gradients(ne, x, y, z, omega):
     """
@@ -49,27 +247,14 @@ def precompute_gradients(ne, x, y, z, omega):
 
     where ``3.14207787e-4 = mₑ ε₀ / e²`` (SI).
 
-    The scalar coefficient ``-0.5 * c² / (3.14207787e-4 * ω²)`` is evaluated
-    in float64 and then multiplied into the (potentially float32) *ne* array.
-    This ordering prevents float32 overflow: computing ``c² * ne`` first would
-    overflow for ``ne ≳ 4×10²²`` m⁻³ (since c² ≈ 9×10¹⁶ and float32 max ≈
-    3.4×10³⁸), whereas the coefficient itself is ≈ −4.6×10⁻¹¹ so the product
-    remains well within float32 range for any sub-critical plasma.
-
     Args:
         ne    (jax.Array): Electron density grid **in m⁻³**, shape ``(Nx, Ny, Nz)``.
-            If your density is in cm⁻³ convert with ``ne_m3 = ne_cc * 1e6`` before
-            passing.  Cells with ``ne ≥ ncr`` (critical density) are physically
-            evanescent; the function warns if any such cells are present, as this
-            causes large gradient magnitudes that can prevent the ODE from converging.
         x, y, z (jax.Array): 1-D coordinate arrays in metres.
         omega (float): Laser angular frequency in rad/s.
 
     Returns:
-        tuple: ``(dndx, dndy, dndz)`` — each a ``(Nx, Ny, Nz)`` JAX array giving
-        the gradient of ``gradient_term`` along the respective axis.
+        tuple: ``(dndx, dndy, dndz)`` — each a ``(Nx, Ny, Nz)`` JAX array.
     """
-    # Critical density for this laser frequency [m^-3]: ncr = me*eps0*omega^2/e^2
     ncr = 3.14207787e-4 * float(omega) ** 2
     ne_max = float(jnp.max(ne))
     if ne_max >= ncr:
@@ -83,8 +268,6 @@ def precompute_gradients(ne, x, y, z, omega):
             stacklevel=2,
         )
 
-    # Compute the scalar coefficient in float64 to preserve precision, then
-    # cast to the dtype of ne to avoid widening the array unnecessarily.
     coeff = np.float64(-0.5) * float(c) ** 2 / (3.14207787e-4 * float(omega) ** 2)
     gradient_term = ne * ne.dtype.type(coeff)
     dndx = jnp.gradient(gradient_term, x, axis=0)
@@ -113,136 +296,75 @@ def dndr(r, dndx, dndy, dndz, x, y, z):
     grad = grad.at[2, :].set(trilinearInterpolator((x, y, z), dndz, r, fill_value=0.0))
     return grad
 
+
 def kappa_inv_brems(ne, Te, Z, omega):
     """
     Compute the inverse bremsstrahlung amplitude absorption rate [1/s] at each
     grid point using the NRL formulary (NRL Plasma Formulary, p.58).
 
-    This follows the same approach as the legacy full_solver implementation.
-    The absorption coefficient is always non-negative; it is used in the ray-
-    tracing ODE as ``da/dt = -kappa * a`` so that amplitude decreases
-    monotonically as rays travel through the plasma.
-
     Args:
-        ne  (jax.Array or float): Electron density in m\ :sup:`-3`.
-        Te  (jax.Array or float): Electron temperature **in eV** (not Kelvin,
-            not Joules).  Must be strictly positive.  May be a scalar (uniform
-            temperature) or a 3-D array with the same shape as *ne*.
-        Z   (jax.Array or float): Mean ion charge state (dimensionless).  May be a scalar
-            (uniform charge state) or a 3-D array with the same shape as *ne*.
+        ne  (jax.Array or float): Electron density in m⁻³.
+        Te  (jax.Array or float): Electron temperature in eV.
+        Z   (jax.Array or float): Mean ion charge state (dimensionless).
         omega (float): Laser angular frequency in rad/s.
 
     Returns:
         jax.Array: Amplitude absorption rate with the same shape as *ne*, units of 1/s.
-
-    Note:
-        The Coulomb logarithm uses the classical minimum impact parameter
-        ``b_min = Z·e / (4πε₀·Tₑ[eV])`` [m] throughout.  This is the
-        simplest NRL formulation and matches the legacy full_solver behaviour.
-        The density must be in m\ :sup:`-3`, temperature in eV, and Z is the
-        mean ion charge state.
     """
     from scipy.constants import e as e_charge, epsilon_0
 
-    ne_cc = ne * 1e-6  # convert m^-3 to cm^-3
-
-    # Electron thermal speed (m/s), Te in eV
+    ne_cc = ne * 1e-6
     v_the = 4.19e5 * jnp.sqrt(Te)
-
-    # Plasma frequency (rad/s), ne_cc in cm^-3
     o_pe = 5.64e4 * jnp.sqrt(ne_cc)
-
-    # Upper limit for Coulomb logarithm argument: max(omega_pe, omega)
     o_max = jnp.maximum(o_pe, omega)
-
-    # Classical minimum impact parameter: b_min = Z·e / (4πε₀·T_e[eV])  [m]
     b_min = Z * e_charge / (4.0 * np.pi * epsilon_0 * Te)
-
-    # Coulomb logarithm (clamped to ≥ 2)
     CL = jnp.maximum(2.0, jnp.log(v_the / (o_max * b_min)))
-
     return 3.1e-5 * Z * c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
 
 
-# ODEs of photon paths, standalone function to support the solve()
 def dsdt(t, s, parallelise, dndx, dndy, dndz, x, y, z, lengths, dims, kappa=None):
     """
     Returns an array with the gradients and velocity per ray for ode_int.
 
     Accepts pre-computed gradient grids ``dndx``, ``dndy``, ``dndz`` (produced
-    by :func:`precompute_gradients`) rather than the raw electron-density array
-    and laser frequency.  Computing the spatial gradients of the driving term
-    once before the ODE loop — rather than at every adaptive time step — is the
-    primary performance optimisation for large-scale runs.
-
-    When *kappa* is ``None`` the state vector has 6 elements per ray
-    ``(x, y, z, vx, vy, vz)``.  When *kappa* is a 3-D JAX array (the
-    pre-computed inverse bremsstrahlung absorption rate) the state vector has 7
-    elements per ray, with the 7th element being the accumulated **optical depth**
-    ``τ = ∫κ dt``.  The ODE is ``dτ/dt = κ(r)`` — a non-stiff, purely
-    positive accumulation.  Amplitude is recovered at output as ``a = exp(-τ)``.
-
-    Tracking τ rather than amplitude directly avoids the stiffness that the
-    equivalent amplitude ODE ``da/dt = -κ·a`` would introduce: that equation has
-    eigenvalue ``-κ``, forcing an explicit solver (Tsit5/RK45) to take step
-    sizes ``Δt ≲ C/κ_norm``.  For realistic FLASH plasmas this can be
-    ``~10¹¹–10¹⁴ s⁻¹``, leading to millions of tiny steps or a solver hang.
+    by :func:`precompute_gradients`).  When *kappa* is provided, state element 6
+    tracks accumulated optical depth τ (amplitude = exp(-τ)).
 
     Args:
         t (float): Dummy time variable (problem is time-invariant).
-        s (jax.Array): Flattened 6N (or 7N) state vector used by the ODE solver.
-        parallelise (bool): When ``True`` each vmap call carries a single ray;
-            the state is reshaped to ``(6, 1)`` (or ``(7, 1)``).  When ``False``
-            the serial path reshapes to ``(6, N)`` (or ``(7, N)``).
-        dndx, dndy, dndz (jax.Array): Pre-computed gradient grids of the
-            refractive-index driving term, shape ``(Nx, Ny, Nz)``.
+        s (jax.Array): Flattened 6N (or 7N) state vector.
+        parallelise (bool): True for vmap path (one ray per call).
+        dndx, dndy, dndz (jax.Array): Pre-computed gradient grids.
         x, y, z (jax.Array): 1-D coordinate arrays in metres.
-        lengths, dims (jax.Array): Domain lengths and grid dimensions (passed
-            through for legacy compatibility; not used inside this function).
-        kappa (jax.Array or None): Pre-computed inverse bremsstrahlung absorption
-            rate grid [1/s].  Pass ``None`` (default) to disable inverse
-            bremsstrahlung.  When provided, state element 6 is the accumulated
-            optical depth ``τ`` (initialised to 0); amplitude is ``exp(-τ)``.
+        lengths, dims (jax.Array): Domain size / resolution (legacy compat).
+        kappa (jax.Array or None): Inv-brems absorption rate grid [1/s].
 
     Returns:
         jax.Array: Flattened 6N (or 7N) derivative array.
     """
-
     nstate = 7 if kappa is not None else 6
 
     if not parallelise:
-        # jnp.reshape() auto converts to a jax array rather than having to do after a numpy reshape
         s = jnp.reshape(s, (nstate, s.size // nstate))
     else:
-        # forces s to be a matrix even if has the indexes of a 1d array such that dsdt() can be generalised
-        s = jnp.reshape(s, (nstate, 1))  # one ray per vmap iteration if parallelised
+        s = jnp.reshape(s, (nstate, 1))
 
     sprime = jnp.zeros_like(s)
 
-    # Position and velocity
-    # needs to be before the reshape to avoid indexing errors
-    r = s[:3, :].T  # transposed so it is of the correct shape for interpolators
+    r = s[:3, :].T
     v = s[3:6, :]
-
     del s
 
-    # must unpack x, y, z tuple here for the sake of dndr, could be earlier but this is easier to pass and more generalised
-    # r must be transposed within dndr(...) else we get an AbstractTerm error due to the effect on the return value
     sprime = sprime.at[3:6, :].set(dndr(r, dndx, dndy, dndz, x, y, z))
     sprime = sprime.at[:3, :].set(v)
 
-    # Inverse bremsstrahlung: accumulate optical depth τ.  dτ/dt = κ(r).
-    # This is non-stiff (κ ≥ 0, no exponential feedback), unlike the
-    # equivalent amplitude ODE da/dt = -κ·a which has eigenvalue -κ and
-    # forces tiny step sizes for large κ.  Amplitude is recovered as exp(-τ).
     if kappa is not None:
         kappa_at_r = trilinearInterpolator((x, y, z), kappa, r, fill_value=0.0)
         sprime = sprime.at[6, :].set(kappa_at_r)
 
-    # Keep derivative shape consistent with solver state shape (flattened 1D state vector).
     return jnp.ravel(sprime)
    
-def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose, inv_brems=False):
+def process_results(solutions, depth_traced, trace_depth, probing_direction, duration, save_points_per_region, ray_batch_count, verbose):
     """
     #for i in enumerate(sol.result):
     #    print(i)
@@ -314,18 +436,10 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
         print("and transpose into the form:", solutions[0].ys.shape, "to work with later code.")
 
     if save_points_per_region == 2 or save_points_per_region == 1:
-        rf_state = solutions[0].ys[:, -1, :].T  # shape (6 or 7, N)
+        rf = solutions[0].ys[:, -1, :].T
 
-        # Use keep_current_plane=True so that rays are recorded at their actual
-        # positions — consistent with trace_and_save_depths.
-        rf_geo, _ = ray_to_Jonesvector(rf_state[:6, :], keep_current_plane=True,
-                                        probing_direction=probing_direction)
-
-        if inv_brems and rf_state.shape[0] == 7:
-            amp = np.asarray(np.exp(-rf_state[6, :]))     # a = exp(-τ)
-            rf_weighted = np.asarray(rf_geo) * amp[np.newaxis, :]
-            return rf_weighted, np.asarray(rf_geo), duration
-        return rf_geo, None, duration
+        # depth_traced + trace_depth or just trace_depth
+        return *ray_to_Jonesvector(rf, ne_extent = depth_traced + trace_depth, probing_direction = probing_direction), duration
     elif save_points_per_region > 2:
         slice_rf_list = []
         slice_Jf_list = []
@@ -362,112 +476,20 @@ def process_results(solutions, depth_traced, trace_depth, probing_direction, dur
     else:
         assert "\nWhat."
 
+def solve_minimal(s0, domain, probing_depth, *, save_points = 2, rtol = 1e-3, atol = 1e-5):
+    """Convenience wrapper around :class:`Propagator`.
+
+    Kept for backward compatibility — constructs a ``Propagator`` and
+    calls it immediately.  New code should use ``Propagator`` directly.
+    """
+    prop = Propagator(domain, probing_depth,
+                      save_points=save_points, rtol=rtol, atol=atol)
+    return prop(s0)
+
+
 def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = True, save_points_per_region = 2, memory_debug = False, lwl = 1064e-9, keep_domain = False, return_raw_results = False, verbose = True):
-    """
-    Trace rays through a scalar plasma domain and return their final state as a
-    Jones vector suitable for downstream diagnostics.
-
-    The beam can be supplied either as a pre-created ray matrix or as a compact
-    parameter tuple that is expanded into rays internally (necessary when domain
-    or ray batching is enabled).
-
-    Args:
-        beam (jax.Array or tuple): Either
-
-            * a ``(6, N)`` array of pre-created rays with rows
-              ``(x, y, z, vx, vy, vz)``; or
-            * a tuple ``(beam_size, divergence, ne_extent, probing_direction,
-              beam_type, seeded)`` whose elements are passed directly to
-              ``core.beam.Beam``.  This form is required when
-              ``ScalarDomain.ray_batch_count > 1``.
-
-        ScalarDomain (core.domain.ScalarDomain): Domain object produced by
-            ``core.domain.ScalarDomain``.  Its ``region_count`` and
-            ``ray_batch_count`` attributes control domain and ray batching
-            respectively.
-        probing_depth (float): Maximum propagation depth in metres along the
-            probing direction.
-        parallelise (bool): Use ``jax.vmap`` to parallelise over rays (default
-            ``True``).  Set to ``False`` to use the legacy serial solver
-            (single domain region only).
-        jitted (bool): JIT-compile the ODE solver with ``equinox.filter_jit``
-            (default ``True``).
-        save_points_per_region (int): Number of time-points saved per domain
-            region by the ODE solver (default ``2``, i.e. start and end).
-            Values greater than 2 return intermediate save points as a stacked
-            array.
-        memory_debug (bool): Print memory diagnostics and write a JAX device
-            memory profile to disk (default ``False``).
-        lwl (float): Laser wavelength in metres (default ``1064e-9``).  Used to
-            compute the angular frequency ``omega = 2π·c/lwl``.
-        keep_domain (bool): Reserved for future use (default ``False``).
-        return_raw_results (bool): Return the raw ``diffrax.Solution`` objects
-            instead of the processed Jones vector (default ``False``).
-        verbose (bool): Print progress and shape information (default ``True``).
-
-    Returns:
-        tuple: ``(rf, Jf, duration)``
-
-            * ``rf`` – Jones vector array of shape ``(4, N)``.  Rows are
-              transverse position and angle pairs; the exact mapping depends on
-              ``probing_direction`` (see ``shared.propagation.ray_to_Jonesvector``).
-              When ``ScalarDomain.inv_brems=True`` each column is multiplied by
-              the corresponding per-ray amplitude so that attenuation is already
-              baked into the output.
-            * ``Jf`` – When ``ScalarDomain.inv_brems=True``: the unweighted
-              (geometric) Jones vector of the same shape as ``rf``, useful for
-              sanity-checking the amplitude weighting.  ``None`` otherwise.
-            * ``duration`` – wall-clock time of the ODE solve in seconds
-              (``numpy.float64``).
-
-            When ``return_raw_results=True`` the tuple is
-            ``(solutions, None, duration)`` where ``solutions`` is a
-            ``numpy`` array of ``diffrax.Solution`` objects.
-
-    Example::
-
-        import jax.numpy as jnp
-        import core.domain as d
-        import core.propagator as p
-
-        # --- domain ---
-        lwl              = 1064e-9          # laser wavelength (m)
-        probing_direction = 'z'
-        Np               = int(1e5)
-
-        domain = d.ScalarDomain(
-            lengths, dims,
-            leeway_factor     = 3,
-            ne_type           = "import",
-            probing_direction = probing_direction,
-            Np                = Np,
-            ne                = ne.v * 1e6,   # electron density in m⁻³
-        )
-
-        # --- beam ---
-        beam_size      = [extent_x, extent_y]  # half-widths (m)
-        probing_extent = extent_z
-        ne_extent      = probing_extent         # initialisation depth
-        divergence     = 0.1e-3                 # half-angle (rad)
-        beam_type      = "rectangular"
-
-        # --- solve ---
-        rf_jax, _, duration = p.solve(
-            (beam_size, divergence, ne_extent, probing_direction, beam_type, False),
-            domain,
-            probing_extent,
-            lwl     = lwl,
-            verbose = False,
-        )
-
-        # rf_jax has shape (4, Np): rows are x, φ_x, y, φ_y
-        # Pass to diagnostics, e.g.:
-        #   import processing.diagnostics as diag
-        #   shadowgrapher = diag.Shadowgraphy(rf_jax, focal_plane=-35)
-        #   shadowgrapher.single_lens_solve()
-    """
-
-    omega = 2 * jnp.pi * (c / lwl)
+    
+    omega = 2 * jnp.pi * (sc.c / lwl)
 
     region_count = ScalarDomain.region_count
     ray_batch_count = ScalarDomain.ray_batch_count
@@ -616,38 +638,19 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             # at end positions are r(vector) + trace_depth (ish) NOT trace_depth(vector)
             print(" --> tracing a depth of", trace_depth, "mm's to the target depth of", target_depth, "mm's")
 
-            t = jnp.linspace(0.0, jnp.sqrt(8.0) * trace_depth / c, 2)
+            t = jnp.linspace(0.0, jnp.sqrt(8.0) * trace_depth / sc.c, 2)
             norm_factor = jnp.max(t)
 
             # 8.0^0.5 is an arbritrary factor to ensure rays have enough time to escape the box
             # think we should change this???
 
             # passed args must be hashable to be made static for jax.jit, tuple is hashable, array & dict are not
-            inv_brems = getattr(ScalarDomain, 'inv_brems', False)
-            kappa_grid = None
-            if inv_brems:
-                kappa_grid = kappa_inv_brems(
-                    ScalarDomain.ne,
-                    ScalarDomain.Te,
-                    ScalarDomain.Z,
-                    omega,
-                )
-
-            # Pre-compute gradient grids once here so the ODE body only does
-            # trilinear interpolation at each adaptive step, not full-grid
-            # jnp.gradient calls.
-            dndx, dndy, dndz = precompute_gradients(
+            args = (
+                parallelise, 
                 ScalarDomain.ne,
                 ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
-                omega,
-            )
-
-            args = (
-                parallelise,
-                dndx, dndy, dndz,
-                ScalarDomain.x, ScalarDomain.y, ScalarDomain.z,
-                ScalarDomain.lengths, ScalarDomain.dims,
-                kappa_grid,
+                omega, 
+                ScalarDomain.lengths, ScalarDomain.dims
             )
 
             ###
@@ -681,11 +684,6 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
 
                 if i == 1:
                     s0_transformed = s0_import.T
-                    # When inv_brems is enabled, append an optical-depth column (0.0).
-                    # State[6] accumulates τ = ∫κ dt; amplitude is recovered as exp(-τ).
-                    if inv_brems:
-                        tau_init = jnp.zeros((Np, 1), dtype=s0_import.dtype)
-                        s0_transformed = jnp.concatenate([s0_transformed, tau_init], axis=1)
                     del s0_import
                 else:
                     # change target_depth back to trace_depth and check the difference
@@ -922,16 +920,13 @@ def solve(beam, ScalarDomain, probing_depth, *, parallelise = True, jitted = Tru
             return solutions, None, duration
         else:
             if not parallelise:
-                rf_geo, _ = ray_to_Jonesvector(solutions.ys[:,-1].reshape(6, Np), keep_current_plane=True, probing_direction = ScalarDomain.probing_direction)
-                return rf_geo, None, duration
+                return *ray_to_Jonesvector(solutions.ys[:,-1].reshape(6, Np), ne_extent = probing_depth, probing_direction = ScalarDomain.probing_direction), duration
             else:
                 # need to confirm there is no mismatch between total depth_traced and the target probing_depth
-                return process_results(solutions, depth_traced, trace_depth, ScalarDomain.probing_direction, duration, save_points_per_region, ray_batch_count, verbose, inv_brems=inv_brems)
+                return process_results(solutions, depth_traced, trace_depth, ScalarDomain.probing_direction, duration, save_points_per_region, ray_batch_count, verbose)
     else:
         print("\nData output as a hdf4.tar.gz file due to limitations of vram/ram space.")
         print("Graphs can be iteratively plotted by cycling through the 'run_n' entries after extraction from .tar.gz format.")
-
-
 def trace_and_save_depths(beam, ScalarDomain, step, depth_max, output_path, *,
                           lwl=1064e-9, jones_components=None, jitted=True,
                           rtol=1e-3, atol=1e-5, verbose=True):

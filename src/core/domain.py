@@ -4,6 +4,8 @@ import numpy as np
 
 import equinox as eqx
 
+import scipy.constants as sc
+
 #from functools import partial
 
 from math import ceil
@@ -23,6 +25,68 @@ from jax import checkpoint
 
 @checkpoint
 '''
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Domain – minimal eqx.Module storing the refractive-index field
+# ──────────────────────────────────────────────────────────────────────
+
+class Domain(eqx.Module):
+    """Minimal equinox domain storing a refractive-index field.
+
+    Stores the 3-D refractive-index grid *n* together with the
+    coordinate arrays and domain metadata required by the
+    :class:`~core.propagator.Propagator`.
+
+    Because the field stored is the dimensionless refractive index
+    (not the electron density), this representation generalises
+    beyond plasmas to any material whose local refractive index is
+    known on a regular grid.
+
+    Usage::
+
+        # Directly from a refractive-index grid:
+        domain = Domain(n=n_field, x=x, y=y, z=z,
+                        lengths=lengths, dims=dims)
+
+        # From an electron-density grid (plasma):
+        domain = Domain.from_ne(ne=ne_field, x=x, y=y, z=z,
+                                lengths=lengths, dims=dims, lwl=351e-9)
+    """
+
+    n: jax.Array        # 3-D refractive-index field
+    x: jax.Array        # 1-D x coordinates
+    y: jax.Array        # 1-D y coordinates
+    z: jax.Array        # 1-D z coordinates
+    lengths: jax.Array  # [Lx, Ly, Lz]
+    dims: jax.Array     # [Nx, Ny, Nz]
+
+    @staticmethod
+    def from_ne(ne, x, y, z, lengths, dims, lwl):
+        """Construct a Domain from an electron-density field.
+
+        Computes the plasma refractive index
+
+            n = sqrt(1 - ne / ncr)
+
+        where ncr = m_e · ε₀ · ω² / e² is the critical density for
+        laser wavelength *lwl*.
+
+        Args:
+            ne (jax.Array): 3-D electron density (m⁻³).
+            x, y, z (jax.Array): 1-D coordinate arrays.
+            lengths (jax.Array): Domain lengths [Lx, Ly, Lz].
+            dims (jax.Array): Grid dimensions [Nx, Ny, Nz].
+            lwl (float): Laser wavelength (metres).
+
+        Returns:
+            Domain with refractive index computed from *ne*.
+        """
+        omega = 2.0 * jnp.pi * (sc.c / lwl)
+        ncr = sc.m_e * sc.epsilon_0 * omega ** 2 / sc.e ** 2
+        n = jnp.sqrt(1.0 - ne / ncr)
+        return Domain(n=n, x=x, y=y, z=z, lengths=lengths, dims=dims)
+
 
 class ScalarDomain(eqx.Module):
     s: jnp.float32

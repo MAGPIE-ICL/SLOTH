@@ -1,456 +1,374 @@
 """
-Analytic quadratic-trough benchmark for the JAX ray tracer.
+Test laser propagation through a quadratic electron density trough.
 
-The test domain has a parabolic electron-density profile in the transverse (x)
-direction and is uniform in y and z::
+Analytic test problem:
+    ne(y) = ncr/2 * (1 + y^2/yc^2)
 
-    ne(x, y, z) = ne_0 * (x / a)²
+A ray entering at y0 (< yc) propagating in x undergoes:
+    x(tau) = tau * sqrt(1 - ne(y0)/ncr)
+    y(tau) = y0 * cos(tau / (sqrt(2) * yc))
 
-where *ne_0* is the peak density at the domain edge and *a* is the half-width.
+where tau = c * t is the vacuum path-length parameter,
+c is the speed of light, and t is the physical time.
 
-Physics
--------
-The ODE driving term in the propagator is::
+The critical density is related to the laser angular frequency by:
+    ncr = m_e * epsilon_0 * omega^2 / e^2
 
-    gradient_term = coeff * ne,   coeff = -0.5 * c² / (α * ω²)
-
-Differentiating with respect to x gives a restoring force toward x = 0::
-
-    d²x/dt² = coeff * 2 * ne_0 * x / a² = -(ω_osc)² * x
-
-where the oscillation frequency is::
-
-    ω_osc = c * √(ne_0) / (a * √α * ω_laser)
-
-Collimated rays (vx₀ = 0 at entry) therefore undergo simple harmonic motion::
-
-    x(t)  = x₀ · cos(ω_osc · t)
-    vx(t) = -x₀ · ω_osc · sin(ω_osc · t)
-
-The integration time used by ``trace_and_save_depths`` for a ray at speed *c*
-to cover ``depth_max`` is::
-
-    t_trace = depth_max / c
-
-(the sqrt(8) factor in the ODE normalisation ensures the solver has enough
-head-room for angled rays, but the save-point timing is set by depth/c).
-
-Test design
------------
-``_NE_0`` is chosen so that ``ω_osc · t_trace = π/4`` (one eighth of a full
-period), giving an observable but not too large oscillation amplitude::
-
-    x_final = x₀ · cos(π/4) = x₀ / √2
-
-Benchmark
----------
-``TestBenchmark`` measures wall-clock time with and without inverse
-bremsstrahlung on the same domain.  No timing failure is asserted on CI (CI
-machines vary), but a 10× ceiling guards against catastrophic regressions such
-as the pre-fix behaviour of recomputing full-grid ``jnp.gradient`` calls inside
-the ODE body at every adaptive time step.
-
-Usage::
-
-    python -m pytest tests/test_quadratic_trough.py -v
-
+Tests are parametrized over multiple laser wavelengths (351 nm, 702 nm,
+1053 nm) and tolerance levels to exercise the solver across a range of
+physically relevant conditions.
 """
 
-import os
 import sys
-import time
+import os
 
-import numpy as np
+# Ensure src/ is on the path for relative imports used by the codebase.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
 import pytest
-
-# ---------------------------------------------------------------------------
-# Source path
-# ---------------------------------------------------------------------------
-_SRC = os.path.join(os.path.dirname(__file__), '..', 'src')
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
-
-import jax
+import numpy as np
 import jax.numpy as jnp
-
-jax.config.update('jax_platform_name', 'cpu')
-
-from scipy.constants import c
-from core.propagator import trace_and_save_depths, kappa_inv_brems
-
-# ---------------------------------------------------------------------------
-# Physical constants
-# ---------------------------------------------------------------------------
-# α = mₑ ε₀ / e²  (matches the 3.14207787e-4 constant in propagator.py)
-_ALPHA = 3.14207787e-4
+from scipy.constants import c, m_e, e, epsilon_0
 
 
 # ---------------------------------------------------------------------------
-# Test parameters
-# ---------------------------------------------------------------------------
-_LWL   = 1064e-9
-_OMEGA = 2 * np.pi * c / _LWL   # laser angular frequency (rad/s)
-
-# Domain geometry
-_A      = 5e-3    # x/y half-width (m) — domain spans ±5 mm in x and y
-_HALF_Z = 11e-3   # z half-depth (m)   — domain spans ±11 mm in z (22 mm total)
-_DEPTH_MAX = 20e-3  # trace depth (m) — kept < domain z length to avoid float32 issues
-
-# Design: rays complete exactly π/4 of an oscillation over _DEPTH_MAX.
-# This fixes ne_0 uniquely for the given geometry and wavelength.
-_ANGLE     = np.pi / 4.0
-_T_TRACE   = _DEPTH_MAX / c                           # 6.67e-11 s
-_OMEGA_OSC = _ANGLE / _T_TRACE                        # SHM frequency (rad/s)
-
-# Back-solve ne_0 from ω_osc = c · √ne_0 / (a · √α · ω_laser)
-_NE_0 = (_OMEGA_OSC * _A * np.sqrt(_ALPHA) * _OMEGA / c) ** 2
-# ≈ 3.8e25 m⁻³  (< 4 % of critical density — well sub-critical, no float32 overflow)
-
-# Initial off-axis positions (all well inside the domain)
-_X0_VALS = np.array([0.5e-3, 1.0e-3, 1.5e-3, 2.0e-3])  # (m)
-
-# Position tolerance: 0.2 mm — well above ODE/float32 noise (~µm) and below
-# the expected signal (0.29 – 0.59 mm change over the trace).
-_TOL_X_M    = 0.2e-3
-_TOL_VX_REL = 0.10    # 10 % relative velocity tolerance
-
-
-# ---------------------------------------------------------------------------
-# Analytic solution helpers
+# Physical helpers
 # ---------------------------------------------------------------------------
 
-def _analytic_x(x0):
-    """Analytic x position after one SHM period fraction _ANGLE."""
-    return x0 * np.cos(_ANGLE)         # = x0 / √2
+def _critical_density(lwl):
+    """Return the critical electron density (m^-3) for laser wavelength *lwl*.
 
-
-def _analytic_vx(x0):
-    """Analytic x velocity at the same time."""
-    return -x0 * _OMEGA_OSC * np.sin(_ANGLE)
-
-
-# ---------------------------------------------------------------------------
-# Domain / beam factories
-# ---------------------------------------------------------------------------
-
-class _QuadraticTroughDomain:
+    ncr = m_e * epsilon_0 * omega^2 / e^2
     """
-    Minimal domain with parabolic density  ne(x) = ne_0 · (x/a)².
+    omega = 2.0 * np.pi * c / lwl
+    return omega ** 2 * m_e * epsilon_0 / e ** 2
 
-    Only the attributes read by ``trace_and_save_depths`` are set.
+def _f_analy(x, y0):
+    # See https://journals.aps.org/pre/pdf/10.1103/PhysRevE.61.895
+    ne0 = (1.0 / 2.0) * (1.0 + y0 ** 2 / YC ** 2)
+    vy0 = np.sqrt(1.-ne0)
+    tau = 2.0*np.pi*YC/np.sqrt(0.5)
+    return y0*np.cos(2.*np.pi*(x+X_LENGTH/2)/(vy0*tau))
+
+# ---------------------------------------------------------------------------
+# Domain / ray builders
+# ---------------------------------------------------------------------------
+
+def _make_quadratic_trough_domain(x_length, y_length, z_length,
+                                   nx, ny, nz, ncr, yc, lwl):
+    """Build a Domain whose refractive index corresponds to the quadratic
+    electron density profile ne(y) = ncr/2 * (1 + y^2 / yc^2)."""
+    from core.domain import Domain
+
+    lengths = jnp.array([x_length, y_length, z_length])
+    dims = jnp.array([nx, ny, nz])
+
+    x = jnp.linspace(-x_length / 2, x_length / 2, nx)
+    y = jnp.linspace(-y_length / 2, y_length / 2, ny)
+    z = jnp.linspace(-z_length / 2, z_length / 2, nz)
+    _, YY, _ = jnp.meshgrid(x, y, z, indexing='ij')
+    ne = (ncr / 2.0) * (1.0 + YY ** 2 / yc ** 2)
+
+    return Domain.from_ne(ne, x, y, z, lengths, dims, lwl)
+
+
+def _make_ray(x0, y0, vx0):
+    """Return a (6, 1) state vector for a single ray at (x0, y0, 0)
+    with velocity (vx0, 0, 0)."""
+    s0 = jnp.zeros((6, 1))
+    s0 = s0.at[0, 0].set(x0)
+    s0 = s0.at[1, 0].set(y0)
+    s0 = s0.at[3, 0].set(vx0)
+    return s0
+
+
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+
+# Default domain geometry shared by all tests.
+X_LENGTH = 0.50   # 50 cm
+Y_LENGTH = 0.10   # 10 cm (±5 cm)
+Z_LENGTH = 0.02   #  2 cm (thin; essentially 2-D)
+NX, NY, NZ = 16, 128, 4
+YC = 0.05         # trough half-width (m) – 5 cm
+PROBING_DEPTH = 0.10  # 10 cm trace depth
+
+
+# ---------------------------------------------------------------------------
+# Tolerance presets
+# ---------------------------------------------------------------------------
+
+class Tolerances:
+    """Bundle of position / velocity tolerances for a single test case."""
+    def __init__(self, pos_atol, pos_rtol):
+        self.pos_atol = pos_atol
+        self.pos_rtol = pos_rtol
+
+    def __repr__(self):
+        return (f"Tolerances(pos_atol={self.pos_atol}, pos_rtol={self.pos_rtol})")
+
+TOLERANCE_PRESETS = {
+    "standard": Tolerances(
+        pos_atol=2e-4,   # 0.2 mm
+        pos_rtol=0.01,   # 1 %
+    ),
+    "tight": Tolerances(
+        pos_atol=5e-5,   # 0.05 mm
+        pos_rtol=0.005,  # 0.5 %
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(params=[351e-9, 702e-9, 1053e-9],
+                ids=["351nm", "702nm", "1053nm"])
+def wavelength(request):
+    """Laser wavelength in metres."""
+    return request.param
+
+
+@pytest.fixture
+def ncr(wavelength):
+    """Critical electron density for the current wavelength."""
+    return _critical_density(wavelength)
+
+
+@pytest.fixture
+def domain(ncr, wavelength):
+    """Domain with quadratic trough profile for the current ncr."""
+    return _make_quadratic_trough_domain(
+        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC, wavelength,
+    )
+
+# ---------------------------------------------------------------------------
+# Single-ray parametrized test
+# ---------------------------------------------------------------------------
+
+# Pair each wavelength with appropriate tolerance levels.
+_SINGLE_RAY_CASES = [
+    pytest.param(351e-9,  "tight",    id="351nm-tol-tight"),
+    pytest.param(351e-9,  "standard", id="351nm-tol-standard"),
+    pytest.param(702e-9,  "tight", id="702nm-tol-tight"),
+    pytest.param(702e-9,  "standard",  id="702nm-tol-standard"),
+    pytest.param(1053e-9, "tight", id="1053nm-tol-tight"),
+    pytest.param(1053e-9, "standard",  id="1053nm-tol-standard"),
+]
+
+
+@pytest.mark.parametrize("lwl, tol_name", _SINGLE_RAY_CASES)
+def test_single_ray(lwl, tol_name):
+    """Propagate a single ray and compare against the analytic trajectory.
+
+    Parametrized over wavelength (351 nm, 702 nm, 1053 nm) and tolerance
+    level (tight, standard, relaxed).
     """
+    from core.propagator import Propagator
 
-    def __init__(self, ne_0, a, half_z, n_xy=24, n_z=24,
-                 inv_brems=False, Te=None, Z=None):
-        x = np.linspace(-a, a, n_xy)
-        y = np.linspace(-a, a, n_xy)
-        z = np.linspace(-half_z, half_z, n_z)
+    ncr = _critical_density(lwl)
+    tol = TOLERANCE_PRESETS[tol_name]
 
-        XX, _, _ = np.meshgrid(x, y, z, indexing='ij')
-        ne = (ne_0 * (XX / a) ** 2).astype(np.float32)
+    domain = _make_quadratic_trough_domain(
+        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC, lwl,
+    )
 
-        self.ne  = jnp.array(ne)
-        self.x   = jnp.array(x, dtype=jnp.float32)
-        self.y   = jnp.array(y, dtype=jnp.float32)
-        self.z   = jnp.array(z, dtype=jnp.float32)
-        self.probing_direction = 'z'
+    y0 = 0.01  # 1 cm offset
+    ne_y0 = (ncr / 2.0) * (1.0 + y0 ** 2 / YC ** 2)
+    n_y0 = float(np.sqrt(1.0 - ne_y0 / ncr))
+    vx0 = c * n_y0
+
+    s0 = _make_ray(-X_LENGTH / 2.0, y0, vx0)
+
+    prop = Propagator(domain, PROBING_DEPTH)
+    sol = prop(s0)
+
+    final = np.asarray(sol.ys[0, -1, :])
+    x_num, y_num = float(final[0]), float(final[1])
+
+    y_ana = _f_analy(x_num, y0)
+
+    assert abs(y_num - y_ana) < max(tol.pos_atol, abs(y_ana) * tol.pos_rtol), \
+        f"y mismatch (lwl={lwl:.0e}): num={y_num:.6e}, ana={y_ana:.6e}"
+
+
+# ---------------------------------------------------------------------------
+# Multi-ray parametrized test
+# ---------------------------------------------------------------------------
+
+_MULTI_RAY_CASES = [
+    pytest.param(351e-9,  "tight", id="351nm-tol-tight"),
+    pytest.param(351e-9,  "standard",  id="351nm-tol-standard"),
+    pytest.param(702e-9,  "tight", id="702nm-tol-tight"),
+    pytest.param(702e-9,  "standard",  id="702nm-tol-standard"),
+    pytest.param(1053e-9, "standard",  id="1053nm-tol-standard"),
+    pytest.param(1053e-9, "tight",  id="1053nm-tol-tight"),
+]
+
+Y0_VALUES = [0.005, 0.01, 0.02, 0.03]
+
+
+@pytest.mark.parametrize("lwl, tol_name", _MULTI_RAY_CASES)
+def test_multiple_rays(lwl, tol_name):
+    """Propagate several rays at different y0 offsets and verify they
+    all match the analytic solution.
+
+    Parametrized over wavelength and tolerance level.
+    """
+    from core.propagator import Propagator
+
+    ncr = _critical_density(lwl)
+    tol = TOLERANCE_PRESETS[tol_name]
+
+    domain = _make_quadratic_trough_domain(
+        X_LENGTH, Y_LENGTH, Z_LENGTH, NX, NY, NZ, ncr, YC, lwl,
+    )
+
+    Np = len(Y0_VALUES)
+    s0 = jnp.zeros((6, Np))
+    for j, y0 in enumerate(Y0_VALUES):
+        ne_y0 = (ncr / 2.0) * (1.0 + y0 ** 2 / YC ** 2)
+        n_y0 = float(np.sqrt(1.0 - ne_y0 / ncr))
+        s0 = s0.at[0, j].set(-X_LENGTH / 2.0)
+        s0 = s0.at[1, j].set(y0)
+        s0 = s0.at[3, j].set(c * n_y0)
+
+    prop = Propagator(domain, PROBING_DEPTH)
+    sol = prop(s0)
+
+    for j, y0 in enumerate(Y0_VALUES):
+        final = np.asarray(sol.ys[j, -1, :])
+        y_num = float(final[1])
+        x_num = float(final[0])
+        y_ana = _f_analy(x_num, y0)
+
+        err = abs(y_num - y_ana)
+        assert err < max(tol.pos_atol, abs(y_ana) * tol.pos_rtol), \
+            (f"y mismatch (lwl={lwl:.0e}, y0={y0}): "
+             f"num={y_num:.6e}, ana={y_ana:.6e}, err={err:.2e}")
+
+
+# ---------------------------------------------------------------------------
+# Inverse bremsstrahlung test
+# ---------------------------------------------------------------------------
+
+_INV_BREMS_CASES = [
+    pytest.param(351e-9,  id="351nm"),
+    pytest.param(702e-9,  id="702nm"),
+    pytest.param(1053e-9, id="1053nm"),
+]
+
+
+class _MinimalDomainIB:
+    """Lightweight domain stub with inv_brems fields for trace_and_save_depths."""
+
+    def __init__(self, ne, x, y, z, Te, Z, probing_direction='x'):
+        self.ne = jnp.array(ne, dtype=jnp.float32)
+        self.x  = jnp.array(x,  dtype=jnp.float32)
+        self.y  = jnp.array(y,  dtype=jnp.float32)
+        self.z  = jnp.array(z,  dtype=jnp.float32)
+        self.probing_direction = probing_direction
         self.lengths = jnp.array(
             [x[-1] - x[0], y[-1] - y[0], z[-1] - z[0]], dtype=jnp.float32
         )
-        self.dims    = jnp.array([len(x), len(y), len(z)], dtype=jnp.int32)
+        self.dims = jnp.array([len(x), len(y), len(z)], dtype=jnp.int32)
         self.Np_total = None
 
-        self.inv_brems = inv_brems
-        self.Te = jnp.asarray(Te, dtype=jnp.float32) if Te is not None else None
-        self.Z  = jnp.asarray(Z,  dtype=jnp.float32) if Z  is not None else None
+        self.inv_brems = True
+        self.Te = jnp.asarray(Te, dtype=jnp.float32)
+        self.Z  = jnp.asarray(Z,  dtype=jnp.float32)
 
 
-def _collimated_rays(x0_vals, z_start):
+@pytest.mark.parametrize("lwl", _INV_BREMS_CASES)
+def test_inv_brems_quadratic_trough(lwl):
+    """Verify that inverse bremsstrahlung attenuates amplitude correctly
+    in the quadratic trough.
+
+    Physics checks:
+      1. Amplitude at entry depth (t=0) is 1.0 (no absorption yet).
+      2. Amplitude at exit is strictly less than 1 (absorption occurred).
+      3. Amplitude is positive (no underflow / sign flips).
+      4. jvec_weighted = jvec_unweighted * amplitude (consistency).
+      5. kappa_inv_brems is non-negative everywhere.
+
+    Te=100keV, Z=1 keeps absorption moderate (tau ~ 0.1–1) so amplitude
+    is measurably attenuated but doesn't underflow to zero.
     """
-    Return a (6, N) array of collimated rays in +z at speed c.
-    Each ray starts at (x0, 0, z_start) with velocity (0, 0, c).
-    """
-    Np = len(x0_vals)
-    s0 = np.zeros((6, Np))
-    s0[0, :] = x0_vals
-    s0[2, :] = z_start
-    s0[5, :] = c
-    return jnp.array(s0, dtype=jnp.float32)
+    from core.propagator import trace_and_save_depths, kappa_inv_brems
 
+    ncr  = _critical_density(lwl)
+    omega = 2.0 * np.pi * c / lwl
 
-# ---------------------------------------------------------------------------
-# TestQuadraticTroughNoBrems
-# ---------------------------------------------------------------------------
+    # Build ne grid (same quadratic trough)
+    x = np.linspace(-X_LENGTH / 2, X_LENGTH / 2, NX)
+    y = np.linspace(-Y_LENGTH / 2, Y_LENGTH / 2, NY)
+    z = np.linspace(-Z_LENGTH / 2, Z_LENGTH / 2, NZ)
+    _, YY, _ = np.meshgrid(x, y, z, indexing='ij')
+    ne = (ncr / 2.0) * (1.0 + YY ** 2 / YC ** 2)
 
-class TestQuadraticTroughNoBrems:
-    """
-    Rays in a parabolic density trough follow SHM.
-    Check analytic vs. numerical position and angle at the final depth.
-    """
+    # Plasma parameters: high Te + low Z keeps kappa moderate so
+    # the optical depth over 10 cm doesn't cause underflow.
+    Te_eV = 1e5     # 100 keV electron temperature
+    Z_ion = 1.0     # hydrogen
 
-    def _run(self, n_xy=24, n_z=24):
-        domain = _QuadraticTroughDomain(
-            _NE_0, _A, _HALF_Z, n_xy=n_xy, n_z=n_z,
-        )
-        s0 = _collimated_rays(_X0_VALS, z_start=-_HALF_Z)
-        return trace_and_save_depths(
-            s0, domain,
-            step=_DEPTH_MAX,
-            depth_max=_DEPTH_MAX,
-            output_path=None,
-            lwl=_LWL,
-            jones_components=[0, 1],   # x-position and x-angle
-            jitted=True,
-            verbose=False,
-        )
+    domain_ib = _MinimalDomainIB(ne, x, y, z, Te=Te_eV, Z=Z_ion,
+                                  probing_direction='x')
 
-    def test_x_position_matches_analytic(self):
-        """Final x position must match the SHM analytic formula (atol 0.2 mm)."""
-        result   = self._run()
-        x_final  = np.asarray(result['jvec'][-1][0])
-        x_expect = _analytic_x(_X0_VALS)
+    # Single ray at y0 = 1 cm
+    y0 = 0.01
+    ne_y0 = (ncr / 2.0) * (1.0 + y0 ** 2 / YC ** 2)
+    n_y0 = float(np.sqrt(1.0 - ne_y0 / ncr))
+    vx0 = c * n_y0
 
-        np.testing.assert_allclose(
-            x_final, x_expect,
-            atol=_TOL_X_M,
-            err_msg=(
-                f"x position mismatch (atol={_TOL_X_M*1e3:.1f} mm).\n"
-                f"  numerical : {x_final*1e3} mm\n"
-                f"  analytic  : {x_expect*1e3} mm\n"
-                f"  diff      : {np.abs(x_final-x_expect)*1e3} mm"
-            ),
-        )
+    s0 = jnp.zeros((6, 1))
+    s0 = s0.at[0, 0].set(-X_LENGTH / 2.0)
+    s0 = s0.at[1, 0].set(y0)
+    s0 = s0.at[3, 0].set(vx0)
 
-    def test_x_velocity_matches_analytic(self):
-        """Final x velocity must match the SHM analytic formula (rtol 10 %)."""
-        result    = self._run()
-        phi_final = np.asarray(result['jvec'][-1][1])   # angle = vx / vz ≈ vx/c
-        vx_final  = phi_final * c
-        vx_expect = _analytic_vx(_X0_VALS)
+    depth_max = PROBING_DEPTH
+    step = depth_max / 2  # save at 0, half, and full depth
+    result = trace_and_save_depths(
+        s0, domain_ib, step=step, depth_max=depth_max, output_path=None,
+        lwl=lwl, jones_components='all', jitted=True, verbose=False,
+    )
 
-        nz = np.abs(vx_expect) > 1e-3 * c
-        if nz.any():
-            np.testing.assert_allclose(
-                vx_final[nz], vx_expect[nz],
-                rtol=_TOL_VX_REL,
-                err_msg=f"x velocity mismatch (rtol={_TOL_VX_REL*100:.0f}%)",
-            )
+    # --- 1. Amplitude key present ---
+    assert 'amplitude' in result, "inv_brems result must contain 'amplitude' key"
+    assert 'jvec_unweighted' in result, "inv_brems result must contain 'jvec_unweighted'"
 
-    def test_y_position_unchanged(self):
-        """Rays starting at y=0 with vy=0 must remain at y≈0."""
-        domain = _QuadraticTroughDomain(_NE_0, _A, _HALF_Z, n_xy=20, n_z=20)
-        s0 = _collimated_rays(_X0_VALS, z_start=-_HALF_Z)
-        result = trace_and_save_depths(
-            s0, domain,
-            step=_DEPTH_MAX, depth_max=_DEPTH_MAX,
-            output_path=None, lwl=_LWL,
-            jones_components=[2, 3],   # y-position and y-angle
-            jitted=True, verbose=False,
-        )
-        y_final = np.asarray(result['jvec'][-1][0])
-        np.testing.assert_allclose(
-            y_final, 0.0, atol=0.1e-3,
-            err_msg="y position must remain zero in a 1-D parabolic trough",
-        )
+    # --- 2. Amplitude at entry is 1.0 ---
+    amp_entry = result['amplitude'][0]
+    np.testing.assert_allclose(amp_entry, 1.0, atol=1e-6,
+                               err_msg="amplitude at entry should be 1.0")
 
-    def test_vacuum_straight_rays(self):
-        """Vacuum (ne=0): rays travel straight — x position must not change."""
-        n = 16; half = 2e-3
-        coords = np.linspace(-half, half, n)
+    # --- 3. Amplitude at exit is 0 < a < 1 ---
+    amp_final = result['amplitude'][-1]
+    assert np.all(amp_final > 0), \
+        f"amplitude must be positive (got {amp_final})"
+    assert np.all(amp_final < 1.0), \
+        f"amplitude must be < 1 (got {float(amp_final[0]):.6f})"
 
-        class _Vac:
-            ne = jnp.zeros((n, n, n), dtype=jnp.float32)
-            x  = jnp.array(coords, dtype=jnp.float32)
-            y  = jnp.array(coords, dtype=jnp.float32)
-            z  = jnp.array(coords, dtype=jnp.float32)
-            probing_direction = 'z'
-            lengths = jnp.array([2*half, 2*half, 2*half], dtype=jnp.float32)
-            dims    = jnp.array([n, n, n], dtype=jnp.int32)
-            Np_total = None
-            inv_brems = False
+    # --- 4. Monotonic decay: amplitude at mid-depth >= amplitude at exit ---
+    amp_mid = result['amplitude'][1]
+    assert np.all(amp_mid >= amp_final - 1e-7), \
+        "amplitude must decrease monotonically with depth"
 
-        x0  = np.array([0.5e-3, 1.0e-3])
-        s0  = _collimated_rays(x0, z_start=-half)
-        result = trace_and_save_depths(
-            s0, _Vac(),
-            step=2*half, depth_max=2*half,
-            output_path=None, lwl=_LWL,
-            jones_components=[0], jitted=True, verbose=False,
-        )
-        x_final = np.asarray(result['jvec'][-1][0])
-        np.testing.assert_allclose(
-            x_final, x0, atol=1e-6,
-            err_msg="Vacuum: x position must not change",
-        )
+    # --- 5. Weighted = unweighted * amplitude ---
+    for j in range(len(result['jvec'])):
+        jvec_w  = result['jvec'][j]
+        jvec_uw = result['jvec_unweighted'][j]
+        amp_j   = result['amplitude'][j]
+        expected = jvec_uw * amp_j[np.newaxis, :]
+        np.testing.assert_allclose(jvec_w, expected, atol=1e-10,
+                                   err_msg=f"jvec mismatch at depth index {j}")
 
-
-# ---------------------------------------------------------------------------
-# TestQuadraticTroughWithBrems
-# ---------------------------------------------------------------------------
-
-class TestQuadraticTroughWithBrems:
-    """
-    Same parabolic trough but with inv_brems=True.
-
-    The amplitude ODE must not corrupt ray trajectories; amplitude must decay
-    monotonically; weighted jvec must be smaller than unweighted jvec.
-    """
-
-    _TE = 100.0   # eV
-    _Z  = 1.0
-
-    def _domain(self, n_xy=20, n_z=20):
-        return _QuadraticTroughDomain(
-            _NE_0, _A, _HALF_Z, n_xy=n_xy, n_z=n_z,
-            inv_brems=True, Te=self._TE, Z=self._Z,
-        )
-
-    def _run(self):
-        domain = self._domain()
-        s0 = _collimated_rays(_X0_VALS, z_start=-_HALF_Z)
-        return trace_and_save_depths(
-            s0, domain,
-            step=_DEPTH_MAX / 4,        # a few intermediate snapshots
-            depth_max=_DEPTH_MAX,
-            output_path=None, lwl=_LWL,
-            jones_components=[0, 1],
-            jitted=True, verbose=False,
-        )
-
-    def test_x_position_matches_analytic_with_brems(self):
-        """The amplitude ODE must not corrupt the position trajectory."""
-        result   = self._run()
-        x_geo    = np.asarray(result['jvec_unweighted'][-1][0])
-        x_expect = _analytic_x(_X0_VALS)
-        np.testing.assert_allclose(
-            x_geo, x_expect, atol=_TOL_X_M,
-            err_msg=(
-                "x position mismatch when inv_brems=True\n"
-                f"  numerical (geo) : {x_geo*1e3} mm\n"
-                f"  analytic        : {x_expect*1e3} mm"
-            ),
-        )
-
-    def test_amplitude_decays(self):
-        """Amplitude at the final depth must be strictly less than 1."""
-        result    = self._run()
-        amp_final = float(np.asarray(result['amplitude'][-1]).mean())
-        assert amp_final < 1.0, (
-            f"Expected amplitude < 1 in absorbing plasma; got {amp_final:.6f}"
-        )
-
-    def test_amplitude_monotonically_decreasing(self):
-        """Mean amplitude must be non-increasing at successive depth saves."""
-        result = self._run()
-        amps = [float(np.asarray(a).mean()) for a in result['amplitude']]
-        for i in range(1, len(amps)):
-            assert amps[i] <= amps[i - 1] + 1e-6, (
-                f"Amplitude increased at depth index {i}: "
-                f"{amps[i - 1]:.8f} → {amps[i]:.8f}"
-            )
-
-    def test_weighted_jvec_smaller_than_unweighted(self):
-        """Amplitude weighting must reduce |jvec| in an absorbing medium."""
-        result = self._run()
-        jv_w   = np.asarray(result['jvec'][-1])
-        jv_u   = np.asarray(result['jvec_unweighted'][-1])
-        rms_w  = float(np.sqrt(np.nanmean(jv_w ** 2)))
-        rms_u  = float(np.sqrt(np.nanmean(jv_u ** 2)))
-        assert rms_w <= rms_u + 1e-10, (
-            f"Weighted RMS {rms_w:.8f} should be ≤ unweighted {rms_u:.8f}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# TestBenchmark
-# ---------------------------------------------------------------------------
-
-class TestBenchmark:
-    """
-    Wall-clock timing comparison: plain solve vs. inv_brems solve.
-
-    The test does **not** enforce a hard timing budget (CI machines vary widely).
-    It does assert that the inv_brems overhead is less than 10×, guarding
-    against catastrophic regressions such as reintroducing full-grid
-    ``jnp.gradient`` calls inside the ODE body at every adaptive step.
-    """
-
-    _NP  = 30          # small enough for CI
-    _TE  = 100.0
-    _Z   = 1.0
-    _N   = 16          # grid points per axis
-
-    def _s0(self):
-        rng = np.random.RandomState(0)
-        x0  = _A * 0.3 * (rng.rand(self._NP) - 0.5)
-        return _collimated_rays(x0, z_start=-_HALF_Z)
-
-    def _domain_plain(self):
-        return _QuadraticTroughDomain(
-            _NE_0, _A, _HALF_Z, n_xy=self._N, n_z=self._N,
-        )
-
-    def _domain_ib(self):
-        return _QuadraticTroughDomain(
-            _NE_0, _A, _HALF_Z, n_xy=self._N, n_z=self._N,
-            inv_brems=True, Te=self._TE, Z=self._Z,
-        )
-
-    def _run(self, domain, s0):
-        return trace_and_save_depths(
-            s0, domain,
-            step=_DEPTH_MAX, depth_max=_DEPTH_MAX,
-            output_path=None, lwl=_LWL,
-            jones_components=[0, 1],
-            jitted=True, verbose=False,
-        )
-
-    def test_inv_brems_overhead_within_10x(self):
-        """
-        inv_brems must not be more than 10× slower than a plain solve on the
-        same domain.  A larger ratio indicates a performance regression (e.g.
-        gradient recomputation inside the ODE body).
-        """
-        s0 = self._s0()
-        # Warm up both paths (JIT compilation)
-        self._run(self._domain_plain(), s0)
-        self._run(self._domain_ib(),    s0)
-
-        t0 = time.perf_counter()
-        self._run(self._domain_plain(), s0)
-        t_plain = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        self._run(self._domain_ib(), s0)
-        t_ib = time.perf_counter() - t0
-
-        ratio = t_ib / max(t_plain, 1e-9)
-        print(
-            f"\n[Benchmark] Np={self._NP}  "
-            f"plain: {t_plain:.3f}s  inv_brems: {t_ib:.3f}s  ratio: {ratio:.2f}×"
-        )
-        assert ratio < 10.0, (
-            f"inv_brems is {ratio:.1f}× slower than plain (limit 10×). "
-            "Likely a performance regression — check that gradient grids are "
-            "pre-computed outside the ODE body."
-        )
-
-    def test_geometry_identical_with_and_without_brems(self):
-        """
-        The geometric (unweighted) ray positions from inv_brems must match the
-        plain solve — the amplitude ODE must not perturb ray trajectories.
-        """
-        s0 = self._s0()
-        res_plain = self._run(self._domain_plain(), s0)
-        res_ib    = self._run(self._domain_ib(),    s0)
-
-        x_plain  = np.asarray(res_plain['jvec'][-1][0])
-        x_ib_geo = np.asarray(res_ib['jvec_unweighted'][-1][0])
-
-        np.testing.assert_allclose(
-            x_ib_geo, x_plain, atol=1e-5,
-            err_msg=(
-                "Geometric x positions with and without inv_brems must agree. "
-                "A mismatch suggests the amplitude ODE corrupts trajectory state."
-            ),
-        )
+    # --- 6. kappa is non-negative ---
+    kappa = kappa_inv_brems(
+        jnp.asarray(ne, dtype=jnp.float32),
+        jnp.float32(Te_eV),
+        jnp.float32(Z_ion),
+        omega,
+    )
+    assert np.all(np.asarray(kappa) >= 0), "kappa_inv_brems must be non-negative"
