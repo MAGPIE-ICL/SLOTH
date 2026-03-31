@@ -320,7 +320,7 @@ class TestQuadraticTroughWithBrems:
     def test_x_position_matches_analytic_with_brems(self):
         """The amplitude ODE must not corrupt the position trajectory."""
         result   = self._run()
-        x_geo    = np.asarray(result['jvec_unweighted'][-1][0])
+        x_geo    = np.asarray(result['jvec'][-1][0])
         x_expect = _analytic_x(_X0_VALS)
         np.testing.assert_allclose(
             x_geo, x_expect, atol=_TOL_X_M,
@@ -349,15 +349,16 @@ class TestQuadraticTroughWithBrems:
                 f"{amps[i - 1]:.8f} → {amps[i]:.8f}"
             )
 
-    def test_weighted_jvec_smaller_than_unweighted(self):
-        """Amplitude weighting must reduce |jvec| in an absorbing medium."""
+    def test_amplitude_weighted_smaller_than_geometric(self):
+        """Manually amplitude-weighting jvec must reduce its RMS in an absorbing medium."""
         result = self._run()
-        jv_w   = np.asarray(result['jvec'][-1])
-        jv_u   = np.asarray(result['jvec_unweighted'][-1])
-        rms_w  = float(np.sqrt(np.nanmean(jv_w ** 2)))
-        rms_u  = float(np.sqrt(np.nanmean(jv_u ** 2)))
-        assert rms_w <= rms_u + 1e-10, (
-            f"Weighted RMS {rms_w:.8f} should be ≤ unweighted {rms_u:.8f}"
+        jv_geo = np.asarray(result['jvec'][-1])
+        amp    = np.asarray(result['amplitude'][-1])
+        jv_weighted = jv_geo * amp[np.newaxis, :]
+        rms_geo = float(np.sqrt(np.nanmean(jv_geo ** 2)))
+        rms_wt  = float(np.sqrt(np.nanmean(jv_weighted ** 2)))
+        assert rms_wt <= rms_geo + 1e-10, (
+            f"Weighted RMS {rms_wt:.8f} should be ≤ geometric {rms_geo:.8f}"
         )
 
 
@@ -437,18 +438,18 @@ class TestBenchmark:
 
     def test_geometry_identical_with_and_without_brems(self):
         """
-        The geometric (unweighted) ray positions from inv_brems must match the
-        plain solve — the amplitude ODE must not perturb ray trajectories.
+        The geometric ray positions from inv_brems must match the plain solve —
+        the amplitude ODE must not perturb ray trajectories.
         """
         s0 = self._s0()
         res_plain = self._run(self._domain_plain(), s0)
         res_ib    = self._run(self._domain_ib(),    s0)
 
-        x_plain  = np.asarray(res_plain['jvec'][-1][0])
-        x_ib_geo = np.asarray(res_ib['jvec_unweighted'][-1][0])
+        x_plain = np.asarray(res_plain['jvec'][-1][0])
+        x_ib    = np.asarray(res_ib['jvec'][-1][0])
 
         np.testing.assert_allclose(
-            x_ib_geo, x_plain, atol=1e-5,
+            x_ib, x_plain, atol=1e-5,
             err_msg=(
                 "Geometric x positions with and without inv_brems must agree. "
                 "A mismatch suggests the amplitude ODE corrupts trajectory state."

@@ -298,7 +298,7 @@ class TestNoAmplitudeKeyWithoutIB:
             "Did not expect 'amplitude' key when inv_brems is False"
         )
         assert 'jvec_unweighted' not in result, (
-            "Did not expect 'jvec_unweighted' key when inv_brems is False"
+            "'jvec_unweighted' has been removed; jvec is always geometric"
         )
 
 
@@ -383,10 +383,10 @@ class TestTeUnitValidation:
         )
 
 
-class TestWeightedJvec:
+class TestGeometricIsolation:
     """
-    When inv_brems=True the returned jvec must be the amplitude-weighted Jones
-    vector, and jvec_unweighted must equal jvec / amplitude.
+    jvec must always be the geometric (unweighted) Jones vector.
+    Absorption changes only the per-ray amplitude, not ray trajectories.
     """
     NE_VAL = 1e25
     TE_VAL = 100.0
@@ -394,61 +394,83 @@ class TestWeightedJvec:
     LWL    = 1064e-9
     HALF   = 3e-3
 
-    def _run(self):
-        domain = _uniform_plasma_domain(
+    def _domain_no_ib(self, n=20):
+        coords = np.linspace(-self.HALF, self.HALF, n)
+        ne     = np.full((n, n, n), self.NE_VAL, dtype=np.float32)
+        return _MinimalDomain(ne, coords, coords, coords, inv_brems=False)
+
+    def _domain_with_ib(self, n=20):
+        return _uniform_plasma_domain(
             self.NE_VAL, Te_val=self.TE_VAL, Z_val=self.Z_VAL,
-            half_size=self.HALF, n=20,
+            half_size=self.HALF, n=n,
         )
-        s0 = _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
+
+    def _s0(self):
+        return _collimated_rays(Np=16, beam_radius=2e-4, z_start=-self.HALF)
+
+    def _run(self, domain):
         return trace_and_save_depths(
-            s0, domain,
+            self._s0(), domain,
             step=500e-6, depth_max=2e-3,
             output_path=None,
             lwl=self.LWL, jitted=True, verbose=False,
         )
 
-    def test_jvec_unweighted_key_present(self):
-        result = self._run()
-        assert 'jvec_unweighted' in result, (
-            "Expected 'jvec_unweighted' key when inv_brems=True"
+    def test_no_jvec_unweighted_key(self):
+        """jvec_unweighted must not appear in the result (key was removed)."""
+        result = self._run(self._domain_with_ib())
+        assert 'jvec_unweighted' not in result, (
+            "'jvec_unweighted' must not be present; jvec is always geometric"
         )
 
-    def test_jvec_weighted_equals_unweighted_times_amplitude(self):
-        """jvec[j] must equal jvec_unweighted[j] * amplitude[j][newaxis]."""
-        result = self._run()
-        for j, (jv_w, jv_u, amp_j) in enumerate(
-            zip(result['jvec'], result['jvec_unweighted'], result['amplitude'])
-        ):
-            expected = jv_u * np.asarray(amp_j)[np.newaxis, :]
+    def test_amplitude_key_present_with_ib(self):
+        """amplitude key must appear when inv_brems=True."""
+        result = self._run(self._domain_with_ib())
+        assert 'amplitude' in result, "Expected 'amplitude' key when inv_brems=True"
+
+    def test_jvec_geometric_same_with_and_without_ib(self):
+        """jvec must be identical for the no-ib and ib runs (same geometry)."""
+        s0      = self._s0()
+        res_no  = trace_and_save_depths(
+            s0, self._domain_no_ib(), step=500e-6, depth_max=2e-3,
+            output_path=None, lwl=self.LWL, jitted=True, verbose=False,
+        )
+        res_ib  = trace_and_save_depths(
+            s0, self._domain_with_ib(), step=500e-6, depth_max=2e-3,
+            output_path=None, lwl=self.LWL, jitted=True, verbose=False,
+        )
+        for j, (jv_no, jv_ib) in enumerate(zip(res_no['jvec'], res_ib['jvec'])):
             np.testing.assert_allclose(
-                jv_w, expected, rtol=1e-6,
-                err_msg=f"jvec weighted/unweighted mismatch at depth index {j}",
+                jv_ib, jv_no, atol=1e-7,
+                err_msg=(
+                    f"jvec mismatch at depth {j}: absorption must not alter "
+                    "ray positions or angles"
+                ),
             )
 
-    def test_jvec_weighted_smaller_than_unweighted(self):
-        """
-        In an absorbing plasma the amplitude < 1, so |jvec| < |jvec_unweighted|
-        at the final depth (ignoring the zero-position depth 0).
-        """
-        result = self._run()
-        # Compare RMS magnitudes at the final save depth (index > 0)
-        jv_w = result['jvec'][-1]
-        jv_u = result['jvec_unweighted'][-1]
-        rms_w = float(np.sqrt(np.mean(jv_w ** 2)))
-        rms_u = float(np.sqrt(np.mean(jv_u ** 2)))
-        assert rms_w < rms_u, (
-            f"Expected weighted jvec RMS ({rms_w:.6f}) < unweighted ({rms_u:.6f})"
+    def test_amplitude_attenuates_intensity(self):
+        """Amplitude must be < 1 in absorbing plasma and < amplitude without ib."""
+        result = self._run(self._domain_with_ib())
+        amp_final = float(np.asarray(result['amplitude'][-1]).mean())
+        assert amp_final < 1.0, (
+            f"Expected amplitude < 1 in absorbing plasma; got {amp_final:.6f}"
         )
 
-    def test_jvec_unweighted_shape_matches_jvec(self):
-        result = self._run()
-        for j, (jv_w, jv_u) in enumerate(
-            zip(result['jvec'], result['jvec_unweighted'])
-        ):
-            assert jv_w.shape == jv_u.shape, (
-                f"Shape mismatch at depth {j}: jvec {jv_w.shape} vs "
-                f"jvec_unweighted {jv_u.shape}"
-            )
+    def test_amplitude_weighted_jvec_differs_from_geometric(self):
+        """
+        Computing jvec * amplitude manually must give a different (smaller RMS)
+        result than jvec alone — confirming amplitude is separable from geometry.
+        """
+        result  = self._run(self._domain_with_ib())
+        jv_geo  = np.asarray(result['jvec'][-1])
+        amp     = np.asarray(result['amplitude'][-1])
+        jv_weighted = jv_geo * amp[np.newaxis, :]
+        rms_geo = float(np.sqrt(np.mean(jv_geo ** 2)))
+        rms_wt  = float(np.sqrt(np.mean(jv_weighted ** 2)))
+        assert rms_wt < rms_geo, (
+            f"Amplitude-weighted RMS ({rms_wt:.8f}) should be < geometric "
+            f"RMS ({rms_geo:.8f})"
+        )
 
 
 class TestArrayZ:
@@ -959,3 +981,203 @@ class TestOvercriticalWarning:
         msg = str(caught[0].message)
         # message must mention the conversion recipe
         assert "1e6" in msg or "ne_cc" in msg or "cm" in msg
+
+
+# ---------------------------------------------------------------------------
+# TestGeometricSeparation  ── the core regression suite
+# ---------------------------------------------------------------------------
+
+class TestGeometricSeparation:
+    """
+    Absorption (inv_brems) must change only amplitude, not ray geometry.
+
+    For the same initial rays and the same plasma field, running with
+    inv_brems=True must produce identical positions, angles, and reconstructed
+    deflection angles as running with inv_brems=False.  Only the per-ray
+    amplitude (exp(-tau)) should differ.
+
+    A parabolic density trough is used so that rays are actually deflected,
+    making any geometry contamination from absorption immediately visible.
+    """
+
+    # Parabolic trough: ne = NE_0 * (1 - (x/A)^2)  in the x direction
+    LWL    = 1064e-9
+    NE_0   = 0.05e27    # m^-3 — peak density (5 % of ncr for 1064 nm)
+    A      = 2.0e-3     # m   — trough half-width
+    HALF_Z = 3.0e-3     # m   — domain half-length in z
+    TE     = 100.0      # eV
+    Z_ION  = 1.0
+    N_XY   = 24
+    N_Z    = 24
+    NP     = 20
+    DEPTH  = 4.0e-3     # m   — trace depth (< 2*HALF_Z)
+    STEP   = 1.0e-3     # m   — save cadence
+
+    # Geometric tolerance: positions to 5 µm, angles to 0.1 mrad
+    # (The ~1e-5 rad noise comes from float32 ODE solver comparing two separate
+    # JIT traces; the original bug caused 10+ mrad differences so 0.1 mrad is
+    # strict enough to catch it.)
+    ATOL_POS = 5e-6   # m
+    ATOL_ANG = 1e-4   # rad  (~0.1 mrad)
+
+    @classmethod
+    def _make_domains(cls):
+        coords_xy = np.linspace(-cls.A * 1.5, cls.A * 1.5, cls.N_XY)
+        coords_z  = np.linspace(-cls.HALF_Z, cls.HALF_Z, cls.N_Z)
+        X, _, _ = np.meshgrid(coords_xy, coords_xy, coords_z, indexing='ij')
+        ne = cls.NE_0 * np.maximum(0.0, 1.0 - (X / cls.A) ** 2).astype(np.float32)
+
+        domain_no_ib = _MinimalDomain(
+            ne, coords_xy, coords_xy, coords_z,
+            probing_direction='z', inv_brems=False,
+        )
+        domain_ib = _MinimalDomain(
+            ne, coords_xy, coords_xy, coords_z,
+            probing_direction='z', inv_brems=True,
+            Te=cls.TE, Z=cls.Z_ION,
+        )
+        return domain_no_ib, domain_ib
+
+    @classmethod
+    def _make_rays(cls):
+        x0 = np.linspace(-0.8 * cls.A, 0.8 * cls.A, cls.NP)
+        y0 = np.zeros(cls.NP)
+        z0 = np.full(cls.NP, -cls.HALF_Z)
+        return jnp.array(
+            np.stack([x0, y0, z0, np.zeros(cls.NP), np.zeros(cls.NP),
+                      np.full(cls.NP, c)], axis=0),
+            dtype=jnp.float32,
+        )
+
+    def _run(self, domain):
+        return trace_and_save_depths(
+            self._make_rays(), domain,
+            step=self.STEP, depth_max=self.DEPTH,
+            output_path=None, lwl=self.LWL,
+            jones_components=[0, 1, 2, 3],
+            jitted=True, verbose=False,
+        )
+
+    def test_final_positions_identical(self):
+        """Final transverse positions must be the same with and without absorption."""
+        dom_no, dom_ib = self._make_domains()
+        r_no = self._run(dom_no)
+        r_ib = self._run(dom_ib)
+        for ax, name in [(0, 'x'), (2, 'y')]:
+            pos_no = np.asarray(r_no['jvec'][-1][ax])
+            pos_ib = np.asarray(r_ib['jvec'][-1][ax])
+            np.testing.assert_allclose(
+                pos_ib, pos_no, atol=self.ATOL_POS,
+                err_msg=(
+                    f"Final {name}-position differs with inv_brems=True. "
+                    "Absorption must not affect ray geometry."
+                ),
+            )
+
+    def test_final_angles_identical(self):
+        """Final deflection angles must be the same with and without absorption."""
+        dom_no, dom_ib = self._make_domains()
+        r_no = self._run(dom_no)
+        r_ib = self._run(dom_ib)
+        for ax, name in [(1, 'phi_x'), (3, 'phi_y')]:
+            ang_no = np.asarray(r_no['jvec'][-1][ax])
+            ang_ib = np.asarray(r_ib['jvec'][-1][ax])
+            np.testing.assert_allclose(
+                ang_ib, ang_no, atol=self.ATOL_ANG,
+                err_msg=(
+                    f"Final angle {name} differs with inv_brems=True. "
+                    "Absorption must not deflect rays."
+                ),
+            )
+
+    def test_all_depth_snapshots_geometric_identical(self):
+        """jvec at every saved depth must match between the two modes."""
+        dom_no, dom_ib = self._make_domains()
+        r_no = self._run(dom_no)
+        r_ib = self._run(dom_ib)
+        for j, (jv_no, jv_ib) in enumerate(zip(r_no['jvec'], r_ib['jvec'])):
+            np.testing.assert_allclose(
+                np.asarray(jv_ib), np.asarray(jv_no), atol=self.ATOL_ANG,
+                err_msg=f"jvec mismatch at depth index {j}",
+            )
+
+    def test_only_amplitude_differs(self):
+        """
+        The amplitude key must exist in the ib run and be < 1 everywhere,
+        while the no-ib run has no amplitude key at all.
+        """
+        dom_no, dom_ib = self._make_domains()
+        r_no = self._run(dom_no)
+        r_ib = self._run(dom_ib)
+        assert 'amplitude' not in r_no, "No amplitude key expected when inv_brems=False"
+        assert 'amplitude' in r_ib,     "amplitude key required when inv_brems=True"
+        for j, amp_j in enumerate(r_ib['amplitude']):
+            amp_arr = np.asarray(amp_j)
+            assert np.all(amp_arr <= 1.0 + 1e-8), (
+                f"Amplitude > 1 at depth {j}: max = {amp_arr.max():.6f}"
+            )
+            assert np.all(amp_arr > 0.0), (
+                f"Non-positive amplitude at depth {j}: min = {amp_arr.min():.6f}"
+            )
+
+    def test_amplitude_weighted_jvec_differs_from_geometric(self):
+        """
+        Multiplying jvec by amplitude (user-level weighting) gives a different,
+        smaller-RMS result than the geometric jvec alone — confirming the two
+        quantities are distinct and separable.
+        """
+        _, dom_ib = self._make_domains()
+        r_ib = self._run(dom_ib)
+        jv_geo = np.asarray(r_ib['jvec'][-1])
+        amp    = np.asarray(r_ib['amplitude'][-1])
+        jv_weighted = jv_geo * amp[np.newaxis, :]
+        rms_geo = float(np.sqrt(np.mean(jv_geo ** 2)))
+        rms_wt  = float(np.sqrt(np.mean(jv_weighted ** 2)))
+        assert rms_wt < rms_geo, (
+            f"Weighted RMS ({rms_wt:.8f}) should be < geometric RMS ({rms_geo:.8f})"
+        )
+
+    def test_shadowgraphy_geometry_identical(self):
+        """
+        Binning rays into a 2-D position histogram (shadowgraphy proxy) must
+        give the same result regardless of inv_brems.  Only the per-bin
+        intensity (weighted by amplitude) should differ.
+        """
+        dom_no, dom_ib = self._make_domains()
+        r_no = self._run(dom_no)
+        r_ib = self._run(dom_ib)
+
+        x_no = np.asarray(r_no['jvec'][-1][0])
+        x_ib = np.asarray(r_ib['jvec'][-1][0])
+
+        bins = np.linspace(-self.A, self.A, 15)
+        hist_no, _ = np.histogram(x_no, bins=bins)
+        hist_ib, _ = np.histogram(x_ib, bins=bins)
+
+        np.testing.assert_array_equal(
+            hist_ib, hist_no,
+            err_msg=(
+                "Shadowgraphy ray-count histogram differs between no-ib and ib. "
+                "Rays must land in the same bins regardless of absorption."
+            ),
+        )
+
+    def test_refractometry_phi_identical(self):
+        """
+        The reconstructed deflection angle phi (Jones vector row 1) used in
+        refractometry must be identical regardless of inv_brems.
+        """
+        dom_no, dom_ib = self._make_domains()
+        r_no = self._run(dom_no)
+        r_ib = self._run(dom_ib)
+
+        phi_no = np.asarray(r_no['jvec'][-1][1])
+        phi_ib = np.asarray(r_ib['jvec'][-1][1])
+
+        np.testing.assert_allclose(
+            phi_ib, phi_no, atol=self.ATOL_ANG,
+            err_msg=(
+                "Refractometry angle phi differs with inv_brems=True. "
+                "Absorption must not change deflection angles."
+            ),
+        )
