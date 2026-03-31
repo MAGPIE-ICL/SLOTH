@@ -135,7 +135,8 @@ class ScalarDomain(eqx.Module):
         :param inv_brems: Enable inverse bremsstrahlung amplitude attenuation.
         :type inv_brems: bool, default: False
 
-        :param Te: Electron temperature field in eV.  Can be a scalar (applied uniformly) or
+        :param Te: Electron temperature field **in eV** (not Kelvin, not Joules).
+            Must be strictly positive (> 0 eV).  Can be a scalar (applied uniformly) or
             a 3-D array with the same shape as *ne*.  Required when *inv_brems* is True.
         :type Te: float or jax.Array, default: None
 
@@ -147,6 +148,7 @@ class ScalarDomain(eqx.Module):
         :raise AssertionError: If ne_type is changed from the default but not set to a valid type.
         :raise AssertionError: If probing_direction is not == "x", "y" or "z".
         :raise AssertionError: If inv_brems is True but Te or Z are not supplied.
+        :raise AssertionError: If Te is supplied but contains a zero or negative value.
 
         :return: Returns an equinox.Module inheriting object containing information about and the generated/imported domain itself.
         :rtype: core.domain.ScalarDomain
@@ -184,7 +186,15 @@ class ScalarDomain(eqx.Module):
             colour.BOLD + "\nTe and Z must both be provided when inv_brems=True." + colour.END
         self.inv_brems = inv_brems
         if Te is not None:
-            self.Te = jnp.asarray(Te, dtype=jnp.float32)
+            _Te = jnp.asarray(Te, dtype=jnp.float32)
+            assert float(jnp.min(_Te)) > 0.0, (
+                colour.BOLD
+                + "\nTe must be a strictly positive electron temperature in eV "
+                  "(received a zero or negative value).  "
+                  "Do not pass Te in Kelvin or Joules."
+                + colour.END
+            )
+            self.Te = _Te
         else:
             self.Te = None
         self.Z = jnp.asarray(Z, dtype=jnp.float32) if Z is not None else None

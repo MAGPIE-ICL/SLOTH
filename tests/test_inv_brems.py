@@ -23,6 +23,7 @@ import sys
 
 import numpy as np
 import pytest
+import scipy.constants
 
 # ---------------------------------------------------------------------------
 # Make sure the project source is importable without installing the package
@@ -38,6 +39,7 @@ jax.config.update('jax_platform_name', 'cpu')
 
 from scipy.constants import c, epsilon_0
 from core.propagator import trace_and_save_depths, kappa_inv_brems
+from core.domain import ScalarDomain
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +302,92 @@ class TestNoAmplitudeKeyWithoutIB:
         )
 
 
+class TestTeUnitValidation:
+    """
+    Te must be supplied in electron-volts (eV), not Kelvin or Joules.
+    The domain must reject zero or negative Te at construction time to prevent
+    silent NaN/inf values in kappa_inv_brems (which uses sqrt(Te), Te^-1.5, etc).
+    """
+
+    # Minimal valid domain parameters used throughout
+    _LENGTHS = [4e-3, 4e-3, 4e-3]
+    _DIMS    = [8, 8, 8]
+
+    def test_negative_Te_raises_on_ScalarDomain(self):
+        """Negative Te must raise AssertionError with a helpful message."""
+        with pytest.raises(AssertionError, match="eV"):
+            ScalarDomain(self._LENGTHS, self._DIMS,
+                         inv_brems=True, Te=-10.0, Z=1.0)
+
+    def test_zero_Te_raises_on_ScalarDomain(self):
+        """Zero Te must raise AssertionError (division by zero in kappa formula)."""
+        with pytest.raises(AssertionError, match="eV"):
+            ScalarDomain(self._LENGTHS, self._DIMS,
+                         inv_brems=True, Te=0.0, Z=1.0)
+
+    def test_negative_Te_array_raises_on_ScalarDomain(self):
+        """A 3-D Te array containing a negative value must also raise."""
+        n = 8
+        Te_arr = np.full((n, n, n), 100.0, dtype=np.float32)
+        Te_arr[0, 0, 0] = -1.0   # one bad cell
+        with pytest.raises(AssertionError, match="eV"):
+            ScalarDomain(self._LENGTHS, self._DIMS,
+                         inv_brems=True, Te=Te_arr, Z=1.0)
+
+    def test_kappa_is_nan_or_inf_for_zero_Te(self):
+        """
+        Directly calling kappa_inv_brems with Te=0 produces non-finite output,
+        confirming the domain-level validation is necessary to prevent silent errors.
+        """
+        kappa_val = kappa_inv_brems(
+            jnp.float32(1e25), jnp.float32(0.0), 1.0,
+            2 * np.pi * c / 1064e-9,
+        )
+        assert not np.isfinite(float(kappa_val)), (
+            "kappa_inv_brems with Te=0 should be non-finite (inf or nan)"
+        )
+
+    def test_positive_Te_eV_is_accepted(self):
+        """Typical ICF/laser-plasma Te values in eV must be accepted without error."""
+        for Te_val in [0.1, 1.0, 100.0, 1000.0, 1e4]:
+            # Should not raise
+            d = ScalarDomain(self._LENGTHS, self._DIMS,
+                             inv_brems=True, Te=float(Te_val), Z=1.0)
+            assert float(d.Te) == pytest.approx(Te_val, rel=1e-5), (
+                f"Te={Te_val} eV was stored incorrectly: got {float(d.Te)}"
+            )
+
+    def test_kelvin_scale_Te_not_rejected_but_kappa_is_huge(self):
+        """
+        Te supplied in Kelvin (e.g. 1.16e6 K for 100 eV) is not rejected
+        (the domain cannot distinguish units), but produces a physically absurd
+        kappa value — orders of magnitude smaller than the eV equivalent.
+
+        kappa ∝ Te^(-3/2), so Te_K ≈ 1.16e4 × Te_eV gives
+        kappa_K ≈ kappa_eV / (1.16e4)^(3/2).  This test documents the behaviour
+        and motivates always passing Te in eV.
+        """
+        Te_eV      = 100.0              # correct usage
+        Te_kelvin  = 100.0 * scipy.constants.physical_constants['electron volt-kelvin relationship'][0]  # same temperature in Kelvin
+
+        omega = 2 * np.pi * c / 1064e-9
+        kappa_eV     = float(kappa_inv_brems(
+            jnp.float32(1e25), jnp.float32(Te_eV),     1.0, omega))
+        kappa_kelvin = float(kappa_inv_brems(
+            jnp.float32(1e25), jnp.float32(Te_kelvin), 1.0, omega))
+
+        # kappa_eV >> kappa_kelvin because kappa ∝ Te^(-3/2)
+        assert kappa_eV > kappa_kelvin * 100, (
+            "kappa with Te in eV should be >> kappa with Te in Kelvin, "
+            "confirming that passing Te in Kelvin gives wrong (far too small) results."
+        )
+
+
 class TestWeightedJvec:
     """
     When inv_brems=True the returned jvec must be the amplitude-weighted Jones
     vector, and jvec_unweighted must equal jvec / amplitude.
     """
-
     NE_VAL = 1e25
     TE_VAL = 100.0
     Z_VAL  = 1.0
@@ -562,27 +644,51 @@ class TestWavelengthScaling:
 
     def test_kappa_scales_as_inverse_omega_squared(self):
         """
-        For the same plasma parameters, kappa(ω₁)/kappa(ω₂) must equal (ω₂/ω₁)²
-        when both wavelengths are in the underdense limit (ωpe < ω).
-        The Coulomb logarithm changes slightly with ω (through ω_max), so we
-        allow a 10 % tolerance.
+        κ ∝ (nₑ/ω)² × CL(ω), where CL changes with ω through ω_max = max(ωpe, ω).
+
+        For the same plasma, the ratio κ(351nm)/κ(1064nm) must match the value
+        predicted by the full formula — i.e. (ω_1064/ω_351)² multiplied by the
+        ratio of the Coulomb logarithms at the two frequencies.  This confirms
+        the dominant ω⁻² scaling is correct while properly accounting for the
+        Coulomb-log variation with laser frequency.
         """
+        from scipy.constants import e as e_charge, epsilon_0 as eps0
+
+        ne_val = self.NE_VAL
+        Te_eV  = self.TE_VAL
+        Z_val  = self.Z_VAL
+        ne_cc  = ne_val * 1e-6
+
+        def _coulomb_log(omega):
+            """Reference CL using the correct b_classical."""
+            v_the = 4.19e5 * np.sqrt(Te_eV)
+            o_pe  = 5.64e4 * np.sqrt(ne_cc)
+            o_max = max(o_pe, omega)
+            b_c   = Z_val * e_charge / (4.0 * np.pi * eps0 * Te_eV)
+            b_q   = 2.760428269727312e-10 / np.sqrt(Te_eV)
+            return max(2.0, np.log(v_the / (o_max * max(b_c, b_q))))
+
         omega_351  = 2 * np.pi * c / 351e-9
         omega_1064 = 2 * np.pi * c / 1064e-9
 
-        kappa_351  = float(kappa_inv_brems(
-            jnp.float32(self.NE_VAL), jnp.float32(self.TE_VAL), self.Z_VAL, omega_351))
-        kappa_1064 = float(kappa_inv_brems(
-            jnp.float32(self.NE_VAL), jnp.float32(self.TE_VAL), self.Z_VAL, omega_1064))
+        cl_351  = _coulomb_log(omega_351)
+        cl_1064 = _coulomb_log(omega_1064)
 
-        ratio_computed   = kappa_351 / kappa_1064
-        ratio_expected   = (omega_1064 / omega_351) ** 2   # = (351/1064)²  ≈ 0.109
+        # Expected ratio: dominant (ω₂/ω₁)² term, corrected for CL variation
+        expected_ratio = (omega_1064 / omega_351) ** 2 * (cl_351 / cl_1064)
+
+        kappa_351  = float(kappa_inv_brems(
+            jnp.float32(ne_val), jnp.float32(Te_eV), Z_val, omega_351))
+        kappa_1064 = float(kappa_inv_brems(
+            jnp.float32(ne_val), jnp.float32(Te_eV), Z_val, omega_1064))
+
+        computed_ratio = kappa_351 / kappa_1064
 
         np.testing.assert_allclose(
-            ratio_computed, ratio_expected, rtol=0.10,
+            computed_ratio, expected_ratio, rtol=1e-3,
             err_msg=(
-                f"κ(351nm)/κ(1064nm) = {ratio_computed:.4f}, "
-                f"expected ≈ (ω_1064/ω_351)² = {ratio_expected:.4f} (10 % tolerance)"
+                f"κ(351nm)/κ(1064nm) = {computed_ratio:.5f}, "
+                f"expected {expected_ratio:.5f} (ω² × CL ratio)"
             ),
         )
 
@@ -682,8 +788,6 @@ class TestCoulombLogClassicalRegime:
     These tests verify that kappa_inv_brems returns the value consistent with the
     correct Coulomb log in both the classical and quantum regimes.
     """
-
-    from scipy.constants import e as _e
 
     @staticmethod
     def _reference_kappa(ne_val, Te_eV, Z_val, omega):

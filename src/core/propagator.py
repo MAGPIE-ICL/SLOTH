@@ -107,14 +107,22 @@ def kappa_inv_brems(ne, Te, Z, omega):
 
     Args:
         ne  (jax.Array or float): Electron density in m\ :sup:`-3`.
-        Te  (jax.Array or float): Electron temperature in eV.  May be a scalar
-            (uniform temperature) or a 3-D array with the same shape as *ne*.
+        Te  (jax.Array or float): Electron temperature **in eV** (not Kelvin,
+            not Joules).  Must be strictly positive.  May be a scalar (uniform
+            temperature) or a 3-D array with the same shape as *ne*.
         Z   (jax.Array or float): Mean ion charge state (dimensionless).  May be a scalar
             (uniform charge state) or a 3-D array with the same shape as *ne*.
         omega (float): Laser angular frequency in rad/s.
 
     Returns:
-        jax.Array: Absorption rate with the same shape as *ne*, units of 1/s.
+        jax.Array: Amplitude absorption rate with the same shape as *ne*, units of 1/s.
+
+    Note:
+        The Coulomb logarithm uses the correct classical minimum impact
+        parameter ``b_classical = Z·e / (4πε₀·Tₑ[eV])`` [m].  For cold
+        plasmas or high-Z ions (Tₑ < ~27·Z² eV) this dominates over the
+        quantum parameter and reduces the Coulomb log relative to the
+        quantum-only limit.
     """
     from scipy.constants import e as e_charge, epsilon_0
 
