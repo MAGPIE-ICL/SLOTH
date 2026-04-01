@@ -174,7 +174,7 @@ class Diagnostic:
     """
 
     # this is in mm's not metres - self.rf is converted to mm's (not sure if everything else is covered though)
-    def __init__(self, rf, *, focal_plane = 0, L = 400, R = 25, Lx = 18, Ly = 13.5, prefilter_input = False):
+    def __init__(self, rf, *, weights = None, focal_plane = 0, L = 400, R = 25, Lx = 18, Ly = 13.5, prefilter_input = False):
         """
         Initialise ray diagnostic.
 
@@ -216,6 +216,9 @@ class Diagnostic:
             assert "rf should not be of Noneype! diffrax clearly failed."
 
         self.r0 = m_to_mm(self.rf)
+        # Per-ray amplitude weights (None = uniform count histogram).
+        # Stored as a float64 array so np.histogram2d accepts it directly.
+        self.weights = np.asarray(weights, dtype=np.float64) if weights is not None else None
 
     def histogram(self, *, bin_scale = 1, pix_x = 3448, pix_y = 2574, clear_mem = False, plain_plot = False, extra_info = True):
         """
@@ -228,13 +231,14 @@ class Diagnostic:
             pix_y (int, optional): number of y pixels in detector plane. Defaults to 2574.
         """
 
-        if plain_plot:
-            x, y = count_nans(self.r0, ret = True)
-        else:
-            x, y = count_nans(self.rf, ret = True)
+        matrix = self.r0 if plain_plot else self.rf
+        mask = ~np.isnan(matrix[0]) & ~np.isnan(matrix[2])
+        x, y = matrix[0, mask], matrix[2, mask]
 
-        self.H, self.xedges, self.yedges = np.histogram2d(x, y, bins=[np.floor(pix_x / bin_scale).astype(np.int64), np.floor(pix_y / bin_scale).astype(np.int64)], range=[[-self.Lx / 2, self.Lx / 2],[-self.Ly / 2, self.Ly / 2]])
-        
+        weights = self.weights[mask] if self.weights is not None else None
+
+        self.H, self.xedges, self.yedges = np.histogram2d(x, y, bins=[np.floor(pix_x / bin_scale).astype(np.int64), np.floor(pix_y / bin_scale).astype(np.int64)], range=[[-self.Lx / 2, self.Lx / 2],[-self.Ly / 2, self.Ly / 2]], weights=weights)
+
         self.H = self.H.T
 
         #Optional - clear ray attributes to save memory
