@@ -84,7 +84,9 @@ jax.config.update('jax_platform_name', 'cpu')
 from scipy.constants import c
 from core.propagator import trace_and_save_depths, kappa_inv_brems, precompute_gradients
 from core.domain import ScalarDomain
-from processing.diagnostics import Diagnostic, plot_amplitude_diagnostics, compare_diagnostics, transmission_map
+from processing.diagnostics import (Diagnostic, plot_amplitude_diagnostics,
+                                    compare_diagnostics, transmission_map,
+                                    apply_ccd_mask, absorption_sanity_check)
 
 # ---------------------------------------------------------------------------
 # Physical constants
@@ -989,4 +991,187 @@ class TestPrefilterAndAmplitudeHelpers:
             f"Panel 0 vmax={vmax0} != panel 1 vmax={vmax1}; "
             "shared scale is required so absorption is not hidden by auto-normalization"
         )
+        plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# TestCCDMask
+# ---------------------------------------------------------------------------
+
+class TestCCDMask:
+    """
+    Tests for CCD rectangular mask applied at the diagnostic stage.
+
+    The CCD mask in Diagnostic.histogram() is intended for post-RTM coordinates
+    (mm).  The standalone apply_ccd_mask helper works in metres.
+    """
+
+    def _make_rf_metres(self, N=100):
+        """Return a (4, N) Jones vector with rays in metres (for apply_ccd_mask)."""
+        rng = np.random.RandomState(42)
+        rf = np.zeros((4, N))
+        rf[0] = (rng.rand(N) - 0.5) * 40e-3      # x ±20 mm = ±0.02 m
+        rf[2] = (rng.rand(N) - 0.5) * 40e-3      # y ±20 mm
+        rf[1] = rng.randn(N) * 1e-4
+        rf[3] = rng.randn(N) * 1e-4
+        return rf
+
+    def _make_rf_mm(self, N=100):
+        """Return a (4, N) Jones vector in mm (simulating post-RTM output)."""
+        rng = np.random.RandomState(42)
+        rf = np.zeros((4, N))
+        rf[0] = (rng.rand(N) - 0.5) * 40      # x ±20 mm
+        rf[2] = (rng.rand(N) - 0.5) * 40      # y ±20 mm
+        rf[1] = rng.randn(N) * 1e-4
+        rf[3] = rng.randn(N) * 1e-4
+        return rf
+
+    # ── apply_ccd_mask standalone helper (works in metres) ──
+
+    def test_apply_ccd_mask_excludes_outside(self):
+        """Rays outside the CCD footprint must be NaN'd."""
+        rf = self._make_rf_metres(200)
+        ccd = (10e-3, 12e-3)   # 10 mm × 12 mm
+        rf_out, _, mask = apply_ccd_mask(rf, ccd_shape_m=ccd)
+        outside = ~mask
+        assert outside.any(), "Some rays should be outside a small CCD"
+        assert np.all(np.isnan(rf_out[0, outside]))
+        assert np.all(np.isnan(rf_out[2, outside]))
+
+    def test_apply_ccd_mask_preserves_inside(self):
+        """Rays inside the CCD footprint must be unchanged."""
+        rf = self._make_rf_metres(200)
+        ccd = (10e-3, 12e-3)
+        rf_out, _, mask = apply_ccd_mask(rf, ccd_shape_m=ccd)
+        inside = mask
+        np.testing.assert_array_equal(rf_out[:, inside], rf[:, inside])
+
+    def test_apply_ccd_mask_weights_zeroed(self):
+        """Weights outside the CCD must be set to zero."""
+        rf = self._make_rf_metres(200)
+        weights = np.ones(200)
+        ccd = (10e-3, 12e-3)
+        _, w_out, mask = apply_ccd_mask(rf, weights=weights, ccd_shape_m=ccd)
+        assert np.all(w_out[~mask] == 0.0)
+        assert np.all(w_out[mask] == 1.0)
+
+    def test_apply_ccd_mask_no_weights(self):
+        """apply_ccd_mask with weights=None must return None for weights."""
+        rf = self._make_rf_metres(50)
+        _, w_out, _ = apply_ccd_mask(rf, weights=None, ccd_shape_m=(10e-3, 12e-3))
+        assert w_out is None
+
+    # ── Diagnostic with ccd_shape_m (post-RTM mm coordinates) ──
+
+    def test_diagnostic_ccd_reduces_histogram(self):
+        """CCD mask must reduce the histogram sum compared to no mask."""
+        # Simulate post-RTM output: construct Diagnostic from mm-scale rf
+        # by manually assigning self.rf in mm after init.
+        rf_m = self._make_rf_metres(500)
+        kw = dict(L=100, R=500, Lx=50, Ly=50)
+
+        diag_no_ccd = Diagnostic(rf_m, **kw)
+        diag_ccd    = Diagnostic(rf_m, ccd_shape_m=(13.5e-3, 18e-3), **kw)
+
+        # Simulate RTM solve output: overwrite self.rf with mm coordinates.
+        rf_mm = self._make_rf_mm(500)
+        diag_no_ccd.rf = rf_mm.copy()
+        diag_ccd.rf    = rf_mm.copy()
+
+        diag_no_ccd.histogram(pix_x=20, pix_y=20)
+        diag_ccd.histogram(pix_x=20, pix_y=20)
+        assert diag_ccd.H.sum() < diag_no_ccd.H.sum(), (
+            "CCD mask must exclude some rays and reduce histogram sum"
+        )
+
+    def test_diagnostic_ccd_with_weights(self):
+        """CCD mask must apply consistently to both geometry and weights."""
+        rf_m = self._make_rf_metres(300)
+        weights = np.full(300, 0.8)
+        kw = dict(L=100, R=500, Lx=50, Ly=50)
+
+        diag = Diagnostic(rf_m, weights=weights, ccd_shape_m=(13.5e-3, 18e-3), **kw)
+        rf_mm = self._make_rf_mm(300)
+        diag.rf = rf_mm.copy()
+        diag.histogram(pix_x=20, pix_y=20)
+        assert diag.H.sum() > 0
+
+        diag_plain = Diagnostic(rf_m, ccd_shape_m=(13.5e-3, 18e-3), **kw)
+        diag_plain.rf = rf_mm.copy()
+        diag_plain.histogram(pix_x=20, pix_y=20)
+        T = transmission_map(diag.H, diag_plain.H)
+        occupied = ~np.isnan(T) & (T > 0)
+        if occupied.any():
+            np.testing.assert_allclose(T[occupied], 0.8, atol=1e-9)
+
+    def test_diagnostic_ccd_none_is_noop(self):
+        """ccd_shape_m=None must produce identical histogram to default."""
+        rf = self._make_rf_metres(100)
+        kw = dict(L=100, R=500, Lx=50, Ly=50)
+        diag_default = Diagnostic(rf, **kw)
+        diag_none    = Diagnostic(rf, ccd_shape_m=None, **kw)
+        diag_default.histogram(pix_x=20, pix_y=20)
+        diag_none.histogram(pix_x=20, pix_y=20)
+        np.testing.assert_array_equal(diag_default.H, diag_none.H)
+
+    def test_ccd_default_shape(self):
+        """Default CCD shape 13.5mm × 18mm must clip correctly."""
+        # Standalone helper works in metres
+        rf = np.zeros((4, 4))
+        rf[0] = [0, 5e-3, 8e-3, 10e-3]   # x positions in metres
+        rf[2] = [0, 5e-3, 8e-3, 10e-3]   # y positions
+        ccd = (13.5e-3, 18e-3)   # half-extents: 6.75mm, 9mm
+        _, _, mask = apply_ccd_mask(rf, ccd_shape_m=ccd)
+        # Ray 0: (0,0) → inside
+        # Ray 1: (5mm, 5mm) → inside (|5e-3| < 6.75e-3 and |5e-3| < 9e-3)
+        # Ray 2: (8mm, 8mm) → outside (|8e-3| > 6.75e-3)
+        # Ray 3: (10mm, 10mm) → outside
+        np.testing.assert_array_equal(mask, [True, True, False, False])
+
+
+# ---------------------------------------------------------------------------
+# TestAbsorptionSanityCheck
+# ---------------------------------------------------------------------------
+
+class TestAbsorptionSanityCheck:
+    """
+    Tests for the absorption_sanity_check diagnostic utility.
+    """
+
+    def test_returns_expected_keys(self):
+        """absorption_sanity_check must return all expected info keys."""
+        info, fig, _ = absorption_sanity_check(
+            ne=1e25, Te=100.0, Z=1.0, lwl=1064e-9, depth=2e-3)
+        assert 'kappa' in info
+        assert 'tau' in info
+        assert 'amplitude' in info
+        assert 'coulomb_log' in info
+        plt.close(fig)
+
+    def test_uniform_plasma_matches_formula(self):
+        """Sanity check output must match direct kappa calculation."""
+        ne, Te, Z = 1e25, 100.0, 1.0
+        lwl = 1064e-9
+        depth = 2e-3
+        omega = 2 * np.pi * c / lwl
+        kappa_ref = float(kappa_inv_brems(
+            jnp.float32(ne), jnp.float32(Te), float(Z), omega))
+        tau_ref = kappa_ref * depth / c
+        info, fig, _ = absorption_sanity_check(ne, Te, Z, lwl, depth)
+        np.testing.assert_allclose(info['kappa'], kappa_ref, rtol=1e-3)
+        np.testing.assert_allclose(info['tau'], tau_ref, rtol=1e-3)
+        plt.close(fig)
+
+    def test_coulomb_log_clamped_at_low_Te(self):
+        """At low Te, Coulomb log must be clamped to 2."""
+        info, fig, _ = absorption_sanity_check(
+            ne=1e25, Te=5.0, Z=1.0, lwl=1064e-9, depth=2e-3)
+        assert info['coulomb_log'] == 2.0
+        plt.close(fig)
+
+    def test_high_density_strong_absorption(self):
+        """At ne=1e26, tau must be >> 1 for moderate Te."""
+        info, fig, _ = absorption_sanity_check(
+            ne=1e26, Te=10.0, Z=1.0, lwl=1064e-9, depth=10e-3)
+        assert info['tau'] > 1.0, f"Expected strong absorption at ne=1e26, got tau={info['tau']}"
         plt.close(fig)
