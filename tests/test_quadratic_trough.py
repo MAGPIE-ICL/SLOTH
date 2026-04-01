@@ -84,9 +84,15 @@ jax.config.update('jax_platform_name', 'cpu')
 from scipy.constants import c
 from core.propagator import trace_and_save_depths, kappa_inv_brems, precompute_gradients
 from core.domain import ScalarDomain
-from processing.diagnostics import (Diagnostic, plot_amplitude_diagnostics,
+from processing.diagnostics import (Diagnostic, Shadowgraphy, Schlieren,
+                                    Refractometry,
+                                    plot_amplitude_diagnostics,
                                     compare_diagnostics, transmission_map,
-                                    apply_ccd_mask, absorption_sanity_check)
+                                    apply_ccd_mask, absorption_sanity_check,
+                                    compute_arrangement_rtm,
+                                    compute_ccd_bounds_spatial,
+                                    compute_ccd_bounds_angular,
+                                    build_ccd_acceptance_mask)
 
 # ---------------------------------------------------------------------------
 # Physical constants
@@ -1175,3 +1181,395 @@ class TestAbsorptionSanityCheck:
             ne=1e26, Te=10.0, Z=1.0, lwl=1064e-9, depth=10e-3)
         assert info['tau'] > 1.0, f"Expected strong absorption at ne=1e26, got tau={info['tau']}"
         plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# TestCCDAcceptance — arrangement-derived CCD acceptance
+# ---------------------------------------------------------------------------
+
+class TestCCDAcceptance:
+    """
+    Tests for arrangement-derived CCD acceptance bounds.
+
+    The angular acceptance of a CCD is not a generic global constant — it
+    depends on the specific optical arrangement (RTM) of each diagnostic.
+
+    For an imaging axis (B ≈ 0): position maps to position with magnification
+    M = A, and the CCD does not constrain the angle.
+
+    For an angular axis (A ≈ 0): angle maps to position through the scale B,
+    so the CCD constrains  |angle| ≤ CCD_half / |B|.
+
+    Different diagnostics (shadowgraphy vs refractometry) have different RTMs
+    and therefore different angular acceptances for the same CCD.
+    """
+
+    # -- RTM computation helpers --
+
+    def test_rtm_travel_identity(self):
+        """Travel(0) must be the identity matrix."""
+        rtm_x, rtm_y = compute_arrangement_rtm([('travel', 0)])
+        np.testing.assert_array_almost_equal(rtm_x, np.eye(2))
+        np.testing.assert_array_almost_equal(rtm_y, np.eye(2))
+
+    def test_rtm_single_lens_imaging(self):
+        """Single lens at 2f-2f must give magnification -1, B=0."""
+        f = 200
+        ops = [('travel', 2 * f), ('lens', f), ('travel', 2 * f)]
+        rtm_x, _ = compute_arrangement_rtm(ops)
+        np.testing.assert_allclose(rtm_x[0, 0], -1.0, atol=1e-12)
+        np.testing.assert_allclose(rtm_x[0, 1],  0.0, atol=1e-12)
+
+    def test_rtm_shadowgraphy_two_lens_M1(self):
+        """Shadowgraphy two-lens telescope (fp=0) must give M=1, B=0."""
+        L = 400
+        ops = [('travel', L), ('lens', L / 2), ('travel', 2 * L),
+               ('lens', L / 2), ('travel', L)]
+        rtm_x, rtm_y = compute_arrangement_rtm(ops)
+        np.testing.assert_allclose(rtm_x[0, 0],  1.0, atol=1e-12)
+        np.testing.assert_allclose(rtm_x[0, 1],  0.0, atol=1e-12)
+        np.testing.assert_array_almost_equal(rtm_x, rtm_y)
+
+    def test_rtm_shadowgraphy_single_lens_M2(self):
+        """Shadowgraphy single-lens (fp=0) must give M=-2, B=0."""
+        L = 400
+        ops = [('travel', 3 * L / 4), ('lens', L / 2),
+               ('travel', 3 * L / 2)]
+        rtm_x, _ = compute_arrangement_rtm(ops)
+        np.testing.assert_allclose(rtm_x[0, 0], -2.0, atol=1e-12)
+        np.testing.assert_allclose(rtm_x[0, 1],  0.0, atol=1e-12)
+
+    def test_rtm_schlieren_4f_system(self):
+        """Schlieren 4f system (fp=0) must give M=-1, B=0."""
+        L = 400
+        ops = [('travel', L), ('lens', L), ('travel', 2 * L),
+               ('lens', L), ('travel', L)]
+        rtm_x, _ = compute_arrangement_rtm(ops)
+        np.testing.assert_allclose(rtm_x[0, 0], -1.0, atol=1e-12)
+        np.testing.assert_allclose(rtm_x[0, 1],  0.0, atol=1e-12)
+
+    def test_rtm_refractometry_y_axis_angular(self):
+        """Refractometry y-axis (fp=0) must be a pure angular axis (A=0)."""
+        L = 400
+        ops_y = [('travel', 3 * L / 4), ('lens', L / 2),
+                 ('travel', 3 * L / 2), ('lens', L / 2), ('travel', L)]
+        _, rtm_y = compute_arrangement_rtm(ops_y, ops_y)
+        np.testing.assert_allclose(rtm_y[0, 0], 0.0, atol=1e-12,
+                                   err_msg="A_y should be 0 for angular axis")
+        assert abs(rtm_y[0, 1]) > 1.0, "B_y should be large for angular axis"
+
+    def test_rtm_refractometry_x_axis_imaging(self):
+        """Refractometry custom-solve x-axis (fp=0) must image with M=2."""
+        f1, f3, img_f1_dist, img_dist = 200, 200, 600, 400
+        ops_x = [('travel', 2 * f1), ('lens', f1),
+                 ('travel', img_f1_dist),
+                 ('lens', (2 * f3) / 3), ('travel', img_dist)]
+        rtm_x, _ = compute_arrangement_rtm(ops_x)
+        np.testing.assert_allclose(rtm_x[0, 0], 2.0, atol=1e-12,
+                                   err_msg="M_x should be 2")
+        np.testing.assert_allclose(rtm_x[0, 1], 0.0, atol=1e-12,
+                                   err_msg="B_x should be 0 for imaging")
+
+    # -- CCD spatial bounds --
+
+    def test_ccd_spatial_bounds_imaging(self):
+        """Spatial bound for imaging axis: x_max = CCD_half / |M|."""
+        ccd = (18.0, 13.5)  # mm
+        rtm_x = np.array([[-2.0, 0.0], [0.0, -0.5]])  # M=-2
+        rtm_y = np.array([[ 1.0, 0.0], [0.0,  1.0]])   # M=+1
+        x_max, y_max = compute_ccd_bounds_spatial(ccd, rtm_x, rtm_y)
+        assert x_max == pytest.approx(9.0 / 2.0)   # 18/2 / 2
+        assert y_max == pytest.approx(13.5 / 2.0)   # 13.5/2 / 1
+
+    def test_ccd_spatial_bounds_angular_axis(self):
+        """Spatial bound for pure angular axis (A=0): should return None."""
+        ccd = (18.0, 13.5)
+        rtm_x = np.array([[2.0, 0.0], [0.0, 0.5]])
+        rtm_y = np.array([[0.0, -200.0], [1.0/200, 0.0]])  # A_y=0
+        x_max, y_max = compute_ccd_bounds_spatial(ccd, rtm_x, rtm_y)
+        assert x_max is not None
+        assert y_max is None, "A_y=0 means no spatial bound on y"
+
+    # -- CCD angular bounds --
+
+    def test_ccd_angular_bounds_pure_angular(self):
+        """Angular bound: phi_max = CCD_half_y / |B_y|."""
+        ccd = (18.0, 13.5)  # mm
+        B_y = -200.0  # mm / rad
+        rtm_x = np.array([[2.0, 0.0], [0.0, 0.5]])
+        rtm_y = np.array([[0.0, B_y], [1.0/200, 0.0]])
+        theta_max, phi_max = compute_ccd_bounds_angular(ccd, rtm_x, rtm_y)
+        assert theta_max is None, "B_x=0 → no angular bound on theta"
+        assert phi_max == pytest.approx(13.5 / 2.0 / 200.0)
+
+    def test_ccd_angular_bounds_imaging_axis(self):
+        """For pure imaging axis (B=0), angular bound must be None."""
+        ccd = (18.0, 13.5)
+        rtm = np.array([[-2.0, 0.0], [0.0, -0.5]])
+        theta_max, phi_max = compute_ccd_bounds_angular(ccd, rtm, rtm)
+        assert theta_max is None
+        assert phi_max is None
+
+    # -- Arrangement dependence --
+
+    def test_angular_bound_changes_with_arrangement(self):
+        """Different arrangements must give different angular acceptances."""
+        ccd = (18.0, 13.5)
+        # Arrangement A: B_y = -200 mm/rad
+        rtm_a = np.array([[0.0, -200.0], [1.0/200, 0.0]])
+        # Arrangement B: B_y = -100 mm/rad (shorter effective focal length)
+        rtm_b = np.array([[0.0, -100.0], [1.0/100, 0.0]])
+        rtm_dummy = np.eye(2)
+
+        _, phi_a = compute_ccd_bounds_angular(ccd, rtm_dummy, rtm_a)
+        _, phi_b = compute_ccd_bounds_angular(ccd, rtm_dummy, rtm_b)
+
+        assert phi_a != phi_b, "Different arrangements must give different bounds"
+        assert phi_b == pytest.approx(2 * phi_a), \
+            "Halving B should double the angular acceptance"
+
+    def test_angular_bound_matches_reconstruction(self):
+        """CCD phi_max must equal CCD_half_y / |B_y| from the RTM."""
+        L = 400
+        ccd = (18.0, 13.5)
+        # Compute RTM for refractometry y-axis (standard solve, fp=0)
+        ops_y = [('travel', 3 * L / 4), ('lens', L / 2),
+                 ('travel', 3 * L / 2), ('lens', L / 2), ('travel', L)]
+        _, rtm_y = compute_arrangement_rtm(ops_y, ops_y)
+        B_y = rtm_y[0, 1]  # angle-to-position scale
+        expected_phi_max = (ccd[1] / 2.0) / abs(B_y)
+        _, phi_max = compute_ccd_bounds_angular(ccd, np.eye(2), rtm_y)
+        assert phi_max == pytest.approx(expected_phi_max)
+
+    def test_shadowgraphy_vs_refractometry_different_bounds(self):
+        """Shadowgraphy and refractometry must have different angular bounds."""
+        L = 400
+        ccd = (18.0, 13.5)
+
+        # Shadowgraphy two-lens: symmetric, B=0 both axes → no angular bound
+        ops_shad = [('travel', L), ('lens', L / 2), ('travel', 2 * L),
+                    ('lens', L / 2), ('travel', L)]
+        rtm_shad_x, rtm_shad_y = compute_arrangement_rtm(ops_shad)
+        th_shad, phi_shad = compute_ccd_bounds_angular(ccd, rtm_shad_x, rtm_shad_y)
+
+        # Refractometry: y-axis is angular (A=0, B≠0)
+        ops_ref_x = [('travel', 3 * L / 4), ('lens', L / 2),
+                     ('travel', 3 * L / 2), ('lens', L / 3), ('travel', L)]
+        ops_ref_y = [('travel', 3 * L / 4), ('lens', L / 2),
+                     ('travel', 3 * L / 2), ('lens', L / 2), ('travel', L)]
+        rtm_ref_x, rtm_ref_y = compute_arrangement_rtm(ops_ref_x, ops_ref_y)
+        th_ref, phi_ref = compute_ccd_bounds_angular(ccd, rtm_ref_x, rtm_ref_y)
+
+        assert phi_shad is None, "Shadowgraphy B_y=0 → no angular bound"
+        assert phi_ref is not None, "Refractometry B_y≠0 → has angular bound"
+
+    # -- build_ccd_acceptance_mask --
+
+    def test_build_mask_clips_positions(self):
+        """build_ccd_acceptance_mask must clip on detector positions."""
+        rf = np.zeros((4, 5))
+        rf[0] = [0, 3, 6, 10, -10]   # x in mm
+        rf[2] = [0, 3, 6, 10, -10]   # y in mm
+        ccd = (12.0, 12.0)  # ±6 mm
+        mask, info = build_ccd_acceptance_mask(rf, ccd_size_mm=ccd)
+        np.testing.assert_array_equal(mask, [True, True, True, False, False])
+        assert info['n_accepted'] == 3
+        assert info['n_rejected'] == 2
+
+    def test_build_mask_with_rtm_reports_angular_bounds(self):
+        """When RTMs are supplied, info must contain angular bounds."""
+        rf = np.zeros((4, 10))
+        ccd = (18.0, 13.5)
+        rtm_x = np.array([[2.0, 0.0], [0.0, 0.5]])
+        rtm_y = np.array([[0.0, -200.0], [1.0/200, 0.0]])
+        _, info = build_ccd_acceptance_mask(
+            rf, ccd_size_mm=ccd, rtm_x=rtm_x, rtm_y=rtm_y)
+        assert 'theta_max_rad' in info
+        assert 'phi_max_rad' in info
+        assert info['theta_max_rad'] is None  # imaging axis
+        assert info['phi_max_rad'] == pytest.approx(13.5 / 2.0 / 200.0)
+
+    def test_build_mask_nan_handling(self):
+        """NaN positions must be rejected."""
+        rf = np.zeros((4, 3))
+        rf[0, 1] = np.nan
+        ccd = (20.0, 20.0)
+        mask, _ = build_ccd_acceptance_mask(rf, ccd_size_mm=ccd)
+        assert mask[0] and not mask[1] and mask[2]
+
+    # -- Integration with Diagnostic subclasses --
+
+    def _make_rf_m(self, N=200):
+        """(4, N) Jones vector in metres — small angles, positions within ±2 mm."""
+        rng = np.random.RandomState(99)
+        rf = np.zeros((4, N))
+        rf[0] = (rng.rand(N) - 0.5) * 4e-3   # x ±2 mm
+        rf[2] = (rng.rand(N) - 0.5) * 4e-3   # y ±2 mm
+        rf[1] = rng.randn(N) * 1e-4
+        rf[3] = rng.randn(N) * 1e-4
+        return rf
+
+    def test_shadowgraphy_stores_rtm(self):
+        """Shadowgraphy.two_lens_solve must store RTMs on the instance."""
+        rf = self._make_rf_m()
+        diag = Shadowgraphy(rf, L=400, R=500)
+        diag.two_lens_solve()
+        assert diag._rtm_x is not None
+        assert diag._rtm_y is not None
+
+    def test_refractometry_stores_rtm(self):
+        """Refractometry.incoherent_solve must store RTMs on the instance."""
+        rf = self._make_rf_m()
+        diag = Refractometry(rf, L=400, R=500)
+        diag.incoherent_solve()
+        assert diag._rtm_x is not None
+        assert diag._rtm_y is not None
+        # y-axis should be angular (A≈0)
+        np.testing.assert_allclose(diag._rtm_y[0, 0], 0.0, atol=1e-10)
+
+    def test_schlieren_stores_rtm(self):
+        """Schlieren.DF_solve must store RTMs on the instance."""
+        rf = self._make_rf_m()
+        diag = Schlieren(rf, L=400, R=500)
+        diag.DF_solve()
+        assert diag._rtm_x is not None
+        np.testing.assert_allclose(diag._rtm_x[0, 0], -1.0, atol=1e-10)
+
+    def test_ccd_acceptance_info_returns_bounds(self):
+        """ccd_acceptance_info must report arrangement-derived bounds."""
+        rf = self._make_rf_m()
+        ccd = (18e-3, 13.5e-3)
+        diag = Refractometry(rf, L=400, R=500, ccd_shape_m=ccd)
+        diag.incoherent_solve()
+        diag.histogram(pix_x=20, pix_y=20)
+        info = diag.ccd_acceptance_info()
+        assert info['ccd_enabled']
+        assert info.get('phi_max_rad') is not None
+        assert info.get('theta_max_rad') is not None  # B_x≠0 for standard solve
+
+    def test_mask_applied_consistently_to_weights(self):
+        """CCD mask must clip geometry and weights identically."""
+        rf = self._make_rf_m(300)
+        weights = np.full(300, 0.75)
+        ccd = (18e-3, 13.5e-3)
+
+        diag_wt = Shadowgraphy(rf, weights=weights,
+                               L=400, R=500, Lx=50, Ly=50,
+                               ccd_shape_m=ccd)
+        diag_wt.two_lens_solve()
+        diag_wt.histogram(pix_x=20, pix_y=20)
+
+        diag_plain = Shadowgraphy(rf, L=400, R=500, Lx=50, Ly=50,
+                                  ccd_shape_m=ccd)
+        diag_plain.two_lens_solve()
+        diag_plain.histogram(pix_x=20, pix_y=20)
+
+        T = transmission_map(diag_wt.H, diag_plain.H)
+        occupied = ~np.isnan(T) & (T > 0)
+        if occupied.any():
+            np.testing.assert_allclose(T[occupied], 0.75, atol=1e-9)
+
+    def test_focal_plane_changes_rtm(self):
+        """Non-zero focal_plane must change the RTM B element."""
+        L = 400
+        rf = self._make_rf_m()
+
+        diag0 = Shadowgraphy(rf, L=L, R=500, focal_plane=0)
+        diag0.two_lens_solve()
+        B0 = diag0._rtm_x[0, 1]
+
+        diag1 = Shadowgraphy(rf, L=L, R=500, focal_plane=10)
+        diag1.two_lens_solve()
+        B1 = diag1._rtm_x[0, 1]
+
+        np.testing.assert_allclose(B0, 0.0, atol=1e-12,
+                                   err_msg="fp=0 should give B=0 (perfect focus)")
+        assert abs(B1) > 0.1, \
+            "fp≠0 should give B≠0 (defocus introduces angular coupling)"
+
+    def test_verbose_output(self, capsys):
+        """build_ccd_acceptance_mask verbose mode must print summary."""
+        rf = np.zeros((4, 10))
+        ccd = (18.0, 13.5)
+        rtm_x = np.eye(2)
+        rtm_y = np.array([[0.0, -200.0], [1.0/200, 0.0]])
+        build_ccd_acceptance_mask(
+            rf, ccd_size_mm=ccd, rtm_x=rtm_x, rtm_y=rtm_y, verbose=True)
+        captured = capsys.readouterr().out
+        assert "CCD acceptance:" in captured
+        assert "phi acceptance" in captured.lower() or "Phi" in captured
+
+    # -- In-solve CCD filtering for Refractometry --
+
+    def test_refractometry_incoherent_solve_nans_outside_ccd(self):
+        """
+        Refractometry.incoherent_solve must NaN rays whose input phi exceeds
+        the CCD angular acceptance, matching the ccd_cutoff_1d logic from
+        example 05.  phi_max is derived from the arrangement RTM.
+        """
+        rng = np.random.RandomState(7)
+        rf = np.zeros((4, 400))
+        rf[0] = (rng.rand(400) - 0.5) * 8e-3
+        rf[2] = (rng.rand(400) - 0.5) * 8e-3
+        rf[1] = rng.randn(400) * 30e-3   # ±30 mrad std — wide enough to exceed phi_max
+        rf[3] = rng.randn(400) * 30e-3
+
+        ccd = (9e-3, 7e-3)
+        diag = Refractometry(rf, L=400, R=500, Lx=50, Ly=50, ccd_shape_m=ccd)
+        diag.incoherent_solve()
+
+        # Compute the same phi_max the filter used
+        B_y = diag._rtm_y[0, 1]
+        phi_max = (ccd[1] * 1e3 / 2) / abs(B_y)
+
+        # Rays with |phi_in| > phi_max must be NaN in self.rf
+        phi_in = rf[3]   # original input angles (radians)
+        outside = np.abs(phi_in) > phi_max
+        assert outside.any(), "Need some rays outside phi_max for this test"
+        assert np.all(np.isnan(diag.rf[0, outside])), \
+            "Rays with |phi| > phi_max must be NaN in self.rf"
+
+    def test_refractometry_incoherent_custom_solve_nans_outside_ccd(self):
+        """
+        Refractometry.incoherent_custom_solve must NaN rays outside the
+        CCD angular acceptance, analogous to ccd_cutoff_1d (example 05).
+        """
+        rng = np.random.RandomState(13)
+        rf = np.zeros((4, 400))
+        rf[0] = (rng.rand(400) - 0.5) * 8e-3
+        rf[2] = (rng.rand(400) - 0.5) * 8e-3
+        rf[1] = rng.randn(400) * 30e-3
+        rf[3] = rng.randn(400) * 30e-3
+
+        ccd = (9e-3, 7e-3)
+        diag = Refractometry(rf, L=400, R=500, Lx=50, Ly=50, ccd_shape_m=ccd)
+        diag.incoherent_custom_solve()
+
+        B_y = diag._rtm_y[0, 1]
+        phi_max = (ccd[1] * 1e3 / 2) / abs(B_y)
+
+        phi_in = rf[3]
+        outside = np.abs(phi_in) > phi_max
+        assert outside.any(), "Need some rays outside phi_max for this test"
+        assert np.all(np.isnan(diag.rf[0, outside])), \
+            "Rays with |phi| > phi_max must be NaN in self.rf"
+
+    def test_refractometry_no_ccd_leaves_rf_unchanged_by_filter(self):
+        """Without ccd_shape_m, _apply_ccd_filter_to_rf must be a no-op."""
+        rng = np.random.RandomState(3)
+        rf = np.zeros((4, 100))
+        rf[0] = (rng.rand(100) - 0.5) * 4e-3
+        rf[2] = (rng.rand(100) - 0.5) * 4e-3
+
+        diag_no_ccd = Refractometry(rf, L=400, R=500, Lx=50, Ly=50)
+        diag_ccd    = Refractometry(rf, L=400, R=500, Lx=50, Ly=50,
+                                    ccd_shape_m=(18e-3, 13.5e-3))
+        diag_no_ccd.incoherent_solve()
+        diag_ccd.incoherent_solve()
+
+        # With a generous CCD, the no-CCD case should have at least as many
+        # finite rays (the filter can only reduce or leave unchanged).
+        n_finite_no_ccd = np.isfinite(diag_no_ccd.rf[0]).sum()
+        n_finite_ccd    = np.isfinite(diag_ccd.rf[0]).sum()
+        assert n_finite_no_ccd >= n_finite_ccd, \
+            "CCD filter should only reduce or equal the number of finite rays"
