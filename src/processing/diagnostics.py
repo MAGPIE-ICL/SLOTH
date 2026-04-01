@@ -621,6 +621,14 @@ class Refractometry(Diagnostic):
     Implements a spherical lens with focal length f1 = L/2 and M = 2 for the spatial axis and a cylindrical lens
     with focal length f1 and f2.
     """
+    def _compute_refractometry_rtm(self, d_obj, f_sph, d_hybrid, f_hybrid_x, f_hybrid_y, d_det):
+        """Compute and store the x/y RTMs for a two-lens refractometer."""
+        ops_x = [('travel', d_obj), ('lens', f_sph), ('travel', d_hybrid),
+                 ('lens', f_hybrid_x), ('travel', d_det)]
+        ops_y = [('travel', d_obj), ('lens', f_sph), ('travel', d_hybrid),
+                 ('lens', f_hybrid_y), ('travel', d_det)]
+        self._rtm_x, self._rtm_y = compute_arrangement_rtm(ops_x, ops_y)
+
     def incoherent_custom_solve(self, f1 = 200, f3 = 200, img_f1_dist = 600, img_dist = 400):
         ##
         ## Is there an efficient way to chain these so needlessly variables are not used without having 1 really long line
@@ -638,12 +646,9 @@ class Refractometry(Diagnostic):
         self.rf = r8
 
         # RTM: x and y axes have different focal lengths for the hybrid lens.
-        d1 = 2 * f1 - self.focal_plane
-        ops_x = [('travel', d1), ('lens', f1), ('travel', img_f1_dist),
-                 ('lens', (2 * f3) / 3), ('travel', img_dist)]
-        ops_y = [('travel', d1), ('lens', f1), ('travel', img_f1_dist),
-                 ('lens', f1), ('travel', img_dist)]
-        self._rtm_x, self._rtm_y = compute_arrangement_rtm(ops_x, ops_y)
+        self._compute_refractometry_rtm(
+            2 * f1 - self.focal_plane, f1, img_f1_dist,
+            (2 * f3) / 3, f1, img_dist)
 
     def incoherent_solve(self):
         ##
@@ -662,14 +667,9 @@ class Refractometry(Diagnostic):
         self.rf = r8
 
         # RTM: x and y axes have different focal lengths for the hybrid lens.
-        d1 = 3 * self.L / 4 - self.focal_plane
-        ops_x = [('travel', d1), ('lens', self.L / 2),
-                 ('travel', 3 * self.L / 2),
-                 ('lens', self.L / 3), ('travel', self.L)]
-        ops_y = [('travel', d1), ('lens', self.L / 2),
-                 ('travel', 3 * self.L / 2),
-                 ('lens', self.L / 2), ('travel', self.L)]
-        self._rtm_x, self._rtm_y = compute_arrangement_rtm(ops_x, ops_y)
+        self._compute_refractometry_rtm(
+            3 * self.L / 4 - self.focal_plane, self.L / 2,
+            3 * self.L / 2, self.L / 3, self.L / 2, self.L)
 
 # ---------------------------------------------------------------------------
 # Amplitude inspection helpers

@@ -1180,6 +1180,7 @@ class TestAbsorptionSanityCheck:
         info, fig, _ = absorption_sanity_check(
             ne=1e26, Te=10.0, Z=1.0, lwl=1064e-9, depth=10e-3)
         assert info['tau'] > 1.0, f"Expected strong absorption at ne=1e26, got tau={info['tau']}"
+        plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
