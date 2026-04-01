@@ -174,7 +174,7 @@ class Diagnostic:
     """
 
     # this is in mm's not metres - self.rf is converted to mm's (not sure if everything else is covered though)
-    def __init__(self, rf, *, weights = None, focal_plane = 0, L = 400, R = 25, Lx = 18, Ly = 13.5, prefilter_input = False):
+    def __init__(self, rf, *, weights = None, focal_plane = 0, L = 400, R = 25, Lx = 18, Ly = 13.5, prefilter_input = False, ccd_shape_m = None):
         """
         Initialise ray diagnostic.
 
@@ -185,9 +185,22 @@ class Diagnostic:
             R (int, optional): Radius of lenses. Defaults to 25.
             Lx (int, optional): Detector size in x. Defaults to 18.
             Ly (float, optional): Detector size in y. Defaults to 13.5.
+            ccd_shape_m (tuple of 2 floats, optional): Physical CCD size
+                ``(Lx, Ly)`` in metres, e.g. ``(18e-3, 13.5e-3)``.
+                When provided, a rectangular mask is applied in
+                :meth:`histogram` after the RTM solve to clip rays to the
+                detector footprint.
         """     
 
         self.focal_plane, self.L, self.R, self.Lx, self.Ly = focal_plane, L, R, Lx, Ly
+        # CCD footprint clipping — applied after the RTM solve in histogram().
+        # ccd_shape_m is (Lx, Ly) in metres; stored as half-extents in mm.
+        if ccd_shape_m is not None:
+            self._ccd_half_x_mm = ccd_shape_m[0] * 1e3 / 2.0
+            self._ccd_half_y_mm = ccd_shape_m[1] * 1e3 / 2.0
+        else:
+            self._ccd_half_x_mm = None
+            self._ccd_half_y_mm = None
 
         if rf is not None:
             assert rf.shape[0] == 4, colour.BOLD + "\nIncorrect format for rf, are you sure you passed the right variable?" + colour.END
@@ -240,6 +253,16 @@ class Diagnostic:
 
         matrix = self.r0 if plain_plot else self.rf
         mask = ~np.isnan(matrix[0]) & ~np.isnan(matrix[2])
+
+        # CCD rectangular clipping (after RTM solve, before binning).
+        # Coordinates at this stage are in mm (self.rf is set by the solve method).
+        if self._ccd_half_x_mm is not None:
+            ccd_mask = (
+                (np.abs(matrix[0]) <= self._ccd_half_x_mm) &
+                (np.abs(matrix[2]) <= self._ccd_half_y_mm)
+            )
+            mask = mask & ccd_mask
+
         x, y = matrix[0, mask], matrix[2, mask]
 
         weights = self.weights[mask] if self.weights is not None else None
@@ -434,6 +457,87 @@ def plot_amplitude_diagnostics(amp, jvec, axes=None):
     return fig, axes
 
 
+def absorption_sanity_check(ne, Te, Z, lwl, depth, *, axes=None):
+    """
+    Compact diagnostic: expected inverse-brems optical depth for given plasma parameters.
+
+    Computes kappa, optical depth tau, and amplitude exp(-tau) for a uniform
+    slab, and produces a 2-panel summary plot:
+      Panel 1: tau vs density for several temperatures.
+      Panel 2: Coulomb log vs temperature.
+
+    Args:
+        ne (float): Electron density in m^-3.
+        Te (float): Electron temperature in eV.
+        Z  (float): Mean ion charge state.
+        lwl (float): Laser wavelength in metres.
+        depth (float): Path length in metres.
+        axes (sequence of 2 Axes, optional): existing axes; created if None.
+
+    Returns:
+        info (dict): Keys ``kappa``, ``tau``, ``amplitude``, ``coulomb_log``.
+        fig, axes
+    """
+    from scipy.constants import c as _c, e as _e, epsilon_0 as _eps0
+
+    omega = 2 * np.pi * _c / lwl
+    ne_cc = ne * 1e-6
+    v_the = 4.19e5 * np.sqrt(Te)
+    o_pe  = 5.64e4 * np.sqrt(ne_cc)
+    o_max = max(o_pe, omega)
+    b_min = Z * _e / (4.0 * np.pi * _eps0 * Te)
+    CL_arg = v_the / (o_max * b_min)
+    CL    = max(2.0, np.log(CL_arg))
+    kappa = 3.1e-5 * Z * _c * (ne_cc / omega) ** 2 * CL * Te ** (-1.5)
+    tau   = kappa * depth / _c
+    amp   = np.exp(-tau)
+
+    info = dict(kappa=kappa, tau=tau, amplitude=amp, coulomb_log=CL,
+                coulomb_log_arg=CL_arg, b_min=b_min)
+
+    if axes is None:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    else:
+        fig = axes[0].get_figure()
+
+    ax0, ax1 = axes
+
+    # Panel 1: tau vs density for several Te values
+    ne_range = np.logspace(22, 27, 200)
+    for Te_v in [10, 50, 100, 500]:
+        ne_cc_v = ne_range * 1e-6
+        v_v = 4.19e5 * np.sqrt(Te_v)
+        o_pe_v = 5.64e4 * np.sqrt(ne_cc_v)
+        o_max_v = np.maximum(o_pe_v, omega)
+        b_min_v = Z * _e / (4.0 * np.pi * _eps0 * Te_v)
+        CL_v = np.maximum(2.0, np.log(v_v / (o_max_v * b_min_v)))
+        kappa_v = 3.1e-5 * Z * _c * (ne_cc_v / omega) ** 2 * CL_v * Te_v ** (-1.5)
+        tau_v = kappa_v * depth / _c
+        ax0.loglog(ne_range, tau_v, label=f'Te={Te_v} eV')
+    ax0.axhline(1.0, color='grey', ls=':', lw=0.8, label=r'$\tau=1$')
+    ax0.axvline(ne, color='firebrick', ls='--', lw=0.8, label=f'ne={ne:.1e}')
+    ax0.set_xlabel(r'$n_e$  (m$^{-3}$)')
+    ax0.set_ylabel(r'$\tau$')
+    ax0.set_title(f'Optical depth ({lwl*1e9:.0f} nm, {depth*1e3:.1f} mm, Z={Z})')
+    ax0.legend(fontsize=7)
+
+    # Panel 2: Coulomb log vs Te
+    Te_range = np.logspace(0, 3, 200)
+    v_t = 4.19e5 * np.sqrt(Te_range)
+    b_min_t = Z * _e / (4.0 * np.pi * _eps0 * Te_range)
+    CL_t = np.maximum(2.0, np.log(v_t / (o_max * b_min_t)))
+    ax1.semilogx(Te_range, CL_t, color='steelblue')
+    ax1.axhline(2.0, color='grey', ls=':', lw=0.8, label='CL floor = 2')
+    ax1.axvline(Te, color='firebrick', ls='--', lw=0.8, label=f'Te={Te} eV')
+    ax1.set_xlabel('Te  (eV)')
+    ax1.set_ylabel('Coulomb logarithm')
+    ax1.set_title('Coulomb log vs temperature')
+    ax1.legend(fontsize=7)
+
+    fig.tight_layout()
+    return info, fig, axes
+
+
 def transmission_map(H_wt, H_plain):
     """
     Per-pixel mean transmission: ``T(i,j) = H_wt(i,j) / H_plain(i,j)``.
@@ -458,6 +562,44 @@ def transmission_map(H_wt, H_plain):
     H_plain = np.asarray(H_plain, dtype=np.float64)
     with np.errstate(invalid='ignore', divide='ignore'):
         return np.where(H_plain > 0, H_wt / H_plain, np.nan)
+
+
+def apply_ccd_mask(rf, weights=None, ccd_shape_m=(13.5e-3, 18e-3)):
+    """
+    Apply a rectangular CCD mask in diagnostic-space coordinates.
+
+    Rays whose positions fall outside the CCD footprint are set to NaN
+    (geometry) and zero (weights), so they are excluded from downstream
+    histograms.
+
+    Args:
+        rf (ndarray, shape (4, N)): Jones vector in metres.
+            Row 0 is the first transverse position (x), row 2 is the second (y).
+        weights (ndarray or None): Per-ray amplitude weights, shape (N,).
+        ccd_shape_m (tuple of 2 floats): Physical CCD full size ``(Lx, Ly)``
+            in metres.  Default is ``(13.5e-3, 18e-3)`` (13.5 mm × 18 mm).
+            Rays outside ``±Lx/2`` in x or ``±Ly/2`` in y are masked.
+
+    Returns:
+        rf_out (ndarray, (4, N)): Masked Jones vector (NaN outside CCD).
+        weights_out (ndarray or None): Masked weights (0 outside CCD).
+        mask (bool ndarray, (N,)): True for rays inside the CCD footprint.
+    """
+    rf = np.array(rf, dtype=np.float64, copy=True)
+    half_x = ccd_shape_m[0] / 2.0
+    half_y = ccd_shape_m[1] / 2.0
+
+    inside = (
+        (np.abs(rf[0]) <= half_x) &
+        (np.abs(rf[2]) <= half_y)
+    )
+    rf[:, ~inside] = np.nan
+
+    if weights is not None:
+        weights = np.array(weights, dtype=np.float64, copy=True)
+        weights[~inside] = 0.0
+
+    return rf, weights, inside
 
 
 def compare_diagnostics(H_plain, H_wt, xedges, yedges, axes=None):
