@@ -186,20 +186,21 @@ class Diagnostic:
             Lx (int, optional): Detector size in x. Defaults to 18.
             Ly (float, optional): Detector size in y. Defaults to 13.5.
             ccd_shape_m (tuple of 2 floats, optional): Physical CCD size
-                (width, height) in metres, e.g. ``(13.5e-3, 18e-3)``.
-                When provided, :func:`apply_ccd_mask` is applied to clip rays
-                to the detector footprint before the RTM solve.
+                ``(Lx, Ly)`` in metres, e.g. ``(18e-3, 13.5e-3)``.
+                When provided, a rectangular mask is applied in
+                :meth:`histogram` after the RTM solve to clip rays to the
+                detector footprint.
         """     
 
         self.focal_plane, self.L, self.R, self.Lx, self.Ly = focal_plane, L, R, Lx, Ly
         # CCD footprint clipping — applied after the RTM solve in histogram().
-        # ccd_shape_m is (width, height) in metres; stored as half-extents in mm.
+        # ccd_shape_m is (Lx, Ly) in metres; stored as half-extents in mm.
         if ccd_shape_m is not None:
-            self._ccd_half_w_mm = ccd_shape_m[0] * 1e3 / 2.0
-            self._ccd_half_h_mm = ccd_shape_m[1] * 1e3 / 2.0
+            self._ccd_half_x_mm = ccd_shape_m[0] * 1e3 / 2.0
+            self._ccd_half_y_mm = ccd_shape_m[1] * 1e3 / 2.0
         else:
-            self._ccd_half_w_mm = None
-            self._ccd_half_h_mm = None
+            self._ccd_half_x_mm = None
+            self._ccd_half_y_mm = None
 
         if rf is not None:
             assert rf.shape[0] == 4, colour.BOLD + "\nIncorrect format for rf, are you sure you passed the right variable?" + colour.END
@@ -255,10 +256,10 @@ class Diagnostic:
 
         # CCD rectangular clipping (after RTM solve, before binning).
         # Coordinates at this stage are in mm (self.rf is set by the solve method).
-        if self._ccd_half_w_mm is not None:
+        if self._ccd_half_x_mm is not None:
             ccd_mask = (
-                (np.abs(matrix[0]) <= self._ccd_half_w_mm) &
-                (np.abs(matrix[2]) <= self._ccd_half_h_mm)
+                (np.abs(matrix[0]) <= self._ccd_half_x_mm) &
+                (np.abs(matrix[2]) <= self._ccd_half_y_mm)
             )
             mask = mask & ccd_mask
 
@@ -573,10 +574,11 @@ def apply_ccd_mask(rf, weights=None, ccd_shape_m=(13.5e-3, 18e-3)):
 
     Args:
         rf (ndarray, shape (4, N)): Jones vector in metres.
-            Row 0 is the first transverse position, row 2 is the second.
+            Row 0 is the first transverse position (x), row 2 is the second (y).
         weights (ndarray or None): Per-ray amplitude weights, shape (N,).
-        ccd_shape_m (tuple of 2 floats): Physical CCD size ``(width, height)``
+        ccd_shape_m (tuple of 2 floats): Physical CCD full size ``(Lx, Ly)``
             in metres.  Default is ``(13.5e-3, 18e-3)`` (13.5 mm × 18 mm).
+            Rays outside ``±Lx/2`` in x or ``±Ly/2`` in y are masked.
 
     Returns:
         rf_out (ndarray, (4, N)): Masked Jones vector (NaN outside CCD).
@@ -584,12 +586,12 @@ def apply_ccd_mask(rf, weights=None, ccd_shape_m=(13.5e-3, 18e-3)):
         mask (bool ndarray, (N,)): True for rays inside the CCD footprint.
     """
     rf = np.array(rf, dtype=np.float64, copy=True)
-    half_w = ccd_shape_m[0] / 2.0
-    half_h = ccd_shape_m[1] / 2.0
+    half_x = ccd_shape_m[0] / 2.0
+    half_y = ccd_shape_m[1] / 2.0
 
     inside = (
-        (np.abs(rf[0]) <= half_w) &
-        (np.abs(rf[2]) <= half_h)
+        (np.abs(rf[0]) <= half_x) &
+        (np.abs(rf[2]) <= half_y)
     )
     rf[:, ~inside] = np.nan
 

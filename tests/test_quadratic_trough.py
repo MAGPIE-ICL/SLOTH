@@ -1115,12 +1115,12 @@ class TestCCDMask:
         np.testing.assert_array_equal(diag_default.H, diag_none.H)
 
     def test_ccd_default_shape(self):
-        """Default CCD shape 13.5mm × 18mm must clip correctly."""
+        """CCD shape (Lx=13.5mm, Ly=18mm) must clip correctly."""
         # Standalone helper works in metres
         rf = np.zeros((4, 4))
         rf[0] = [0, 5e-3, 8e-3, 10e-3]   # x positions in metres
         rf[2] = [0, 5e-3, 8e-3, 10e-3]   # y positions
-        ccd = (13.5e-3, 18e-3)   # half-extents: 6.75mm, 9mm
+        ccd = (13.5e-3, 18e-3)   # full size (Lx, Ly); half: 6.75mm, 9mm
         _, _, mask = apply_ccd_mask(rf, ccd_shape_m=ccd)
         # Ray 0: (0,0) → inside
         # Ray 1: (5mm, 5mm) → inside (|5e-3| < 6.75e-3 and |5e-3| < 9e-3)
