@@ -84,7 +84,7 @@ jax.config.update('jax_platform_name', 'cpu')
 from scipy.constants import c
 from core.propagator import trace_and_save_depths, kappa_inv_brems, precompute_gradients
 from core.domain import ScalarDomain
-from processing.diagnostics import Diagnostic, plot_amplitude_diagnostics, compare_diagnostics
+from processing.diagnostics import Diagnostic, plot_amplitude_diagnostics, compare_diagnostics, transmission_map
 
 # ---------------------------------------------------------------------------
 # Physical constants
@@ -912,4 +912,81 @@ class TestPrefilterAndAmplitudeHelpers:
             diag_plain.xedges, diag_plain.yedges,
         )
         assert len(axes) == 3
+        plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # 5.  transmission_map recovers uniform weight correctly
+    # ------------------------------------------------------------------
+
+    def test_transmission_map_uniform_weights_recovers_amplitude(self):
+        """
+        For spatially uniform weights w, transmission_map must equal w at every
+        occupied pixel.  This verifies that H_wt/H_plain cancels the ray-density
+        variation and leaves only the absorption factor.
+        """
+        s0, dom = self._rays_and_domain()
+        res  = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+        N    = np.asarray(jvec).shape[-1]
+        w    = 0.76  # matches user-reported mean for 1064 nm
+
+        uniform_amp = np.full(N, w, dtype=np.float64)
+
+        diag_plain = Diagnostic(jvec, L=100, R=50, Lx=50, Ly=50)
+        diag_wt    = Diagnostic(jvec, weights=uniform_amp, L=100, R=50, Lx=50, Ly=50)
+        diag_plain.histogram(pix_x=30, pix_y=30)
+        diag_wt.histogram(pix_x=30, pix_y=30)
+
+        T = transmission_map(diag_wt.H, diag_plain.H)
+        occupied = ~np.isnan(T)
+        assert occupied.any(), "No occupied pixels — increase Lx/Ly or bin count"
+
+        np.testing.assert_allclose(
+            T[occupied], w, atol=1e-9,
+            err_msg=(
+                f"transmission_map must equal {w} everywhere for uniform weights; "
+                f"got min={T[occupied].min():.6f}, max={T[occupied].max():.6f}"
+            ),
+        )
+
+    def test_transmission_map_nan_for_empty_pixels(self):
+        """Empty bins (H_plain == 0) must be nan in the transmission map."""
+        H_plain = np.array([[1.0, 0.0], [2.0, 0.0]])
+        H_wt    = np.array([[0.8, 0.0], [1.6, 0.0]])
+        T = transmission_map(H_wt, H_plain)
+        assert np.isnan(T[0, 1]) and np.isnan(T[1, 1]), \
+            "Empty bins must map to nan in transmission_map"
+        np.testing.assert_allclose(T[0, 0], 0.8, atol=1e-12)
+        np.testing.assert_allclose(T[1, 0], 0.8, atol=1e-12)
+
+    def test_compare_diagnostics_shared_scale(self):
+        """
+        compare_diagnostics must use a shared color scale for the first two panels
+        so a uniform attenuation is visible rather than hidden by auto-normalization.
+        The weighted panel's image vmax must equal the unweighted panel's vmax.
+        """
+        s0, dom = self._rays_and_domain()
+        res  = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+        N    = np.asarray(jvec).shape[-1]
+
+        amp = np.full(N, 0.76, dtype=np.float64)
+        diag_plain = Diagnostic(jvec, L=100, R=50, Lx=50, Ly=50)
+        diag_wt    = Diagnostic(jvec, weights=amp, L=100, R=50, Lx=50, Ly=50)
+        diag_plain.histogram(pix_x=20, pix_y=20)
+        diag_wt.histogram(pix_x=20, pix_y=20)
+
+        fig, axes = compare_diagnostics(
+            diag_plain.H, diag_wt.H,
+            diag_plain.xedges, diag_plain.yedges,
+        )
+        ax0, ax1, _ = axes
+        # Both image panels must share the same clim so the attenuation magnitude
+        # is preserved in the visual comparison.
+        vmax0 = ax0.get_images()[0].norm.vmax
+        vmax1 = ax1.get_images()[0].norm.vmax
+        assert vmax0 == vmax1, (
+            f"Panel 0 vmax={vmax0} != panel 1 vmax={vmax1}; "
+            "shared scale is required so absorption is not hidden by auto-normalization"
+        )
         plt.close(fig)

@@ -434,14 +434,43 @@ def plot_amplitude_diagnostics(amp, jvec, axes=None):
     return fig, axes
 
 
+def transmission_map(H_wt, H_plain):
+    """
+    Per-pixel mean transmission: ``T(i,j) = H_wt(i,j) / H_plain(i,j)``.
+
+    This isolates the absorption effect from the ray-density (refraction) effect.
+    Where many rays land, :attr:`H_wt` is larger but so is :attr:`H_plain`; the
+    ratio cancels the density variation and leaves only the mean local amplitude.
+
+    For uniform weights ``w``, every occupied pixel returns exactly ``w``.
+    For spatially varying absorption the map shows where losses are strongest.
+    Empty pixels (zero ray count) are set to ``nan``.
+
+    Args:
+        H_wt    (2-D array): amplitude-weighted histogram.
+        H_plain (2-D array): unweighted ray-count histogram (same shape).
+
+    Returns:
+        T (2-D float64 array): per-pixel mean transmission in [0, 1]; nan where
+        H_plain == 0.
+    """
+    H_wt    = np.asarray(H_wt,    dtype=np.float64)
+    H_plain = np.asarray(H_plain, dtype=np.float64)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return np.where(H_plain > 0, H_wt / H_plain, np.nan)
+
+
 def compare_diagnostics(H_plain, H_wt, xedges, yedges, axes=None):
     """
     Three-panel comparison: unweighted count image, weighted intensity image,
-    and their pixel-wise ratio (weighted / unweighted).
+    and the per-pixel transmission map (weighted / unweighted).
 
-    Ratio > 1 is clipped to 1.  Bins with zero counts are shown in grey.
-    This is the primary tool for checking whether absorption is measurably
-    reducing intensity relative to a uniform-illumination baseline.
+    The unweighted and weighted panels share the same color scale so that a
+    uniform 24 % attenuation is immediately visible as a darker weighted image
+    rather than being hidden by independent auto-normalization.
+
+    The transmission panel uses :func:`transmission_map` and has a fixed
+    scale of [0, 1].  Bins with zero counts are shown in grey.
 
     Args:
         H_plain  (2-D array): unweighted histogram (count image).
@@ -456,11 +485,13 @@ def compare_diagnostics(H_plain, H_wt, xedges, yedges, axes=None):
     H_plain = np.asarray(H_plain, dtype=np.float64)
     H_wt    = np.asarray(H_wt,    dtype=np.float64)
 
-    with np.errstate(invalid='ignore', divide='ignore'):
-        ratio = np.where(H_plain > 0, H_wt / H_plain, np.nan)
+    T = transmission_map(H_wt, H_plain)
 
     extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
     kw = dict(origin='lower', extent=extent, interpolation='nearest', aspect='auto')
+
+    # Shared scale for panels 0 and 1 so attenuation magnitude is visible.
+    shared_vmax = max(H_plain.max(), H_wt.max())
 
     if axes is None:
         fig, axes = plt.subplots(1, 3, figsize=(14, 4))
@@ -469,18 +500,18 @@ def compare_diagnostics(H_plain, H_wt, xedges, yedges, axes=None):
 
     ax0, ax1, ax2 = axes
 
-    im0 = ax0.imshow(H_plain, **kw, cmap='inferno')
+    im0 = ax0.imshow(H_plain, **kw, cmap='inferno', vmin=0, vmax=shared_vmax)
     ax0.set_title('Unweighted (count)')
     plt.colorbar(im0, ax=ax0)
 
-    im1 = ax1.imshow(H_wt, **kw, cmap='inferno')
+    im1 = ax1.imshow(H_wt, **kw, cmap='inferno', vmin=0, vmax=shared_vmax)
     ax1.set_title('Weighted (intensity)')
     plt.colorbar(im1, ax=ax1)
 
     cmap_r = mpl.colormaps.get_cmap('RdBu_r').copy()
     cmap_r.set_bad(color='lightgrey')
-    im2 = ax2.imshow(ratio, **kw, cmap=cmap_r, vmin=0, vmax=1)
-    ax2.set_title('Ratio  weighted / unweighted')
+    im2 = ax2.imshow(T, **kw, cmap=cmap_r, vmin=0, vmax=1)
+    ax2.set_title('Transmission  (weighted / count)')
     plt.colorbar(im2, ax=ax2)
 
     for ax in axes:
