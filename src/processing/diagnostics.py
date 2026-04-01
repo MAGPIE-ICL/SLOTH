@@ -629,6 +629,27 @@ class Refractometry(Diagnostic):
                  ('lens', f_hybrid_y), ('travel', d_det)]
         self._rtm_x, self._rtm_y = compute_arrangement_rtm(ops_x, ops_y)
 
+    def _apply_ccd_filter_to_rf(self):
+        """
+        NaN rays in ``self.rf`` that fall outside the CCD footprint.
+
+        Applied at the end of each solve when ``ccd_shape_m`` was supplied
+        at construction time.  The CCD is treated as a rectangular aperture
+        centred on the optical axis: rays with ``|x| > Lx/2`` or
+        ``|y| > Ly/2`` (all in mm) are set to NaN, exactly as
+        :func:`circular_aperture` and :func:`rect_aperture` do for lenses.
+
+        No-op when ``ccd_shape_m`` was not supplied (``_ccd_half_x_mm`` is
+        ``None``).
+        """
+        if self._ccd_half_x_mm is None:
+            return
+        outside = (
+            (np.abs(self.rf[0]) > self._ccd_half_x_mm) |
+            (np.abs(self.rf[2]) > self._ccd_half_y_mm)
+        )
+        self.rf[:, outside] = np.nan
+
     def incoherent_custom_solve(self, f1 = 200, f3 = 200, img_f1_dist = 600, img_dist = 400):
         ##
         ## Is there an efficient way to chain these so needlessly variables are not used without having 1 really long line
@@ -650,6 +671,10 @@ class Refractometry(Diagnostic):
             2 * f1 - self.focal_plane, f1, img_f1_dist,
             (2 * f3) / 3, f1, img_dist)
 
+        # CCD filter: NaN rays outside detector footprint (applied in-solve,
+        # consistent with the circular_aperture / rect_aperture pattern).
+        self._apply_ccd_filter_to_rf()
+
     def incoherent_solve(self):
         ##
         ## Is there an efficient way to chain these so needlessly variables are not used without having 1 really long line
@@ -670,6 +695,10 @@ class Refractometry(Diagnostic):
         self._compute_refractometry_rtm(
             3 * self.L / 4 - self.focal_plane, self.L / 2,
             3 * self.L / 2, self.L / 3, self.L / 2, self.L)
+
+        # CCD filter: NaN rays outside detector footprint (applied in-solve,
+        # consistent with the circular_aperture / rect_aperture pattern).
+        self._apply_ccd_filter_to_rf()
 
 # ---------------------------------------------------------------------------
 # Amplitude inspection helpers
