@@ -204,7 +204,14 @@ class Diagnostic:
             self.Np_inc = self.Np
             
             if prefilter_input:
-                self.rf = lens_cutoff(self.rf, L = self.L, R = self.R)
+                # Compute the lens-cutoff mask explicitly so we can apply it
+                # consistently to both the geometry array and the weight array.
+                _xp = self.L * np.tan(self.rf[1]) + self.rf[0]
+                _yp = self.L * np.tan(self.rf[3]) + self.rf[2]
+                _prefilter_mask = np.sqrt(_xp ** 2 + _yp ** 2) <= self.R
+                self.rf = self.rf[:, _prefilter_mask]
+                if weights is not None:
+                    weights = np.asarray(weights)[_prefilter_mask]
                 self.Np_inc = self.rf.shape[-1]
 
             if self.Np == self.Np_inc:
@@ -374,3 +381,142 @@ class Refractometry(Diagnostic):
         r7 = lens(r6, self.L/3, self.L/2)       # lens 2 - hybrid lens
         r8 = travel(r7, self.L)               # displace rays to detector
         self.rf = r8
+
+# ---------------------------------------------------------------------------
+# Amplitude inspection helpers
+# ---------------------------------------------------------------------------
+
+def plot_amplitude_diagnostics(amp, jvec, axes=None):
+    """
+    Two-panel amplitude debug view.
+
+    Panel 1: histogram / PDF of amplitude values — shows whether attenuation
+             is uniform or has a spread, and how far values are from 1.
+    Panel 2: amplitude vs x-position (jvec row 0) — shows where in the beam
+             cross-section losses are largest.
+
+    Args:
+        amp  (array-like, shape (N,)): per-ray amplitude weights (exp(-tau)).
+        jvec (array-like, shape (4, N)): geometric Jones vector [x, theta, y, phi].
+        axes (sequence of 2 Axes, optional): existing axes; created if None.
+
+    Returns:
+        fig, axes
+    """
+    amp  = np.asarray(amp, dtype=np.float64)
+    jvec = np.asarray(jvec)
+
+    if axes is None:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    else:
+        fig = axes[0].get_figure()
+
+    ax0, ax1 = axes
+
+    # Panel 1: PDF of amplitude
+    ax0.hist(amp, bins=40, density=True, color='steelblue', edgecolor='none')
+    ax0.axvline(amp.mean(), color='firebrick', linestyle='--',
+                label=f'mean = {amp.mean():.4f}')
+    ax0.set_xlabel('amplitude  exp(−τ)')
+    ax0.set_ylabel('density')
+    ax0.set_title('Amplitude distribution')
+    ax0.legend(fontsize=8)
+
+    # Panel 2: amplitude vs x position
+    x = jvec[0]
+    ax1.scatter(x * 1e3, amp, s=6, alpha=0.6, color='steelblue')
+    ax1.axhline(1.0, color='grey', linestyle=':', linewidth=0.8)
+    ax1.set_xlabel('x  (mm)')
+    ax1.set_ylabel('amplitude  exp(−τ)')
+    ax1.set_title('Amplitude vs x position')
+
+    fig.tight_layout()
+    return fig, axes
+
+
+def transmission_map(H_wt, H_plain):
+    """
+    Per-pixel mean transmission: ``T(i,j) = H_wt(i,j) / H_plain(i,j)``.
+
+    This isolates the absorption effect from the ray-density (refraction) effect.
+    Where many rays land, :attr:`H_wt` is larger but so is :attr:`H_plain`; the
+    ratio cancels the density variation and leaves only the mean local amplitude.
+
+    For uniform weights ``w``, every occupied pixel returns exactly ``w``.
+    For spatially varying absorption the map shows where losses are strongest.
+    Empty pixels (zero ray count) are set to ``nan``.
+
+    Args:
+        H_wt    (2-D array): amplitude-weighted histogram.
+        H_plain (2-D array): unweighted ray-count histogram (same shape).
+
+    Returns:
+        T (2-D float64 array): per-pixel mean transmission in [0, 1]; nan where
+        H_plain == 0.
+    """
+    H_wt    = np.asarray(H_wt,    dtype=np.float64)
+    H_plain = np.asarray(H_plain, dtype=np.float64)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return np.where(H_plain > 0, H_wt / H_plain, np.nan)
+
+
+def compare_diagnostics(H_plain, H_wt, xedges, yedges, axes=None):
+    """
+    Three-panel comparison: unweighted count image, weighted intensity image,
+    and the per-pixel transmission map (weighted / unweighted).
+
+    The unweighted and weighted panels share the same color scale so that a
+    uniform 24 % attenuation is immediately visible as a darker weighted image
+    rather than being hidden by independent auto-normalization.
+
+    The transmission panel uses :func:`transmission_map` and has a fixed
+    scale of [0, 1].  Bins with zero counts are shown in grey.
+
+    Args:
+        H_plain  (2-D array): unweighted histogram (count image).
+        H_wt     (2-D array): amplitude-weighted histogram.
+        xedges   (1-D array): x bin edges from np.histogram2d.
+        yedges   (1-D array): y bin edges from np.histogram2d.
+        axes     (sequence of 3 Axes, optional): created if None.
+
+    Returns:
+        fig, axes
+    """
+    H_plain = np.asarray(H_plain, dtype=np.float64)
+    H_wt    = np.asarray(H_wt,    dtype=np.float64)
+
+    T = transmission_map(H_wt, H_plain)
+
+    extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
+    kw = dict(origin='lower', extent=extent, interpolation='nearest', aspect='auto')
+
+    # Shared scale for panels 0 and 1 so attenuation magnitude is visible.
+    shared_vmax = max(H_plain.max(), H_wt.max())
+
+    if axes is None:
+        fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    else:
+        fig = axes[0].get_figure()
+
+    ax0, ax1, ax2 = axes
+
+    im0 = ax0.imshow(H_plain, **kw, cmap='inferno', vmin=0, vmax=shared_vmax)
+    ax0.set_title('Unweighted (count)')
+    plt.colorbar(im0, ax=ax0)
+
+    im1 = ax1.imshow(H_wt, **kw, cmap='inferno', vmin=0, vmax=shared_vmax)
+    ax1.set_title('Weighted (intensity)')
+    plt.colorbar(im1, ax=ax1)
+
+    cmap_r = mpl.colormaps.get_cmap('RdBu_r').copy()
+    cmap_r.set_bad(color='lightgrey')
+    im2 = ax2.imshow(T, **kw, cmap=cmap_r, vmin=0, vmax=1)
+    ax2.set_title('Transmission  (weighted / count)')
+    plt.colorbar(im2, ax=ax2)
+
+    for ax in axes:
+        ax.set_xlabel('x  (mm)')
+        ax.set_ylabel('y  (mm)')
+
+    fig.tight_layout()
+    return fig, axes
