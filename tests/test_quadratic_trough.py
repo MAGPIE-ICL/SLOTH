@@ -1502,49 +1502,57 @@ class TestCCDAcceptance:
     # -- In-solve CCD filtering for Refractometry --
 
     def test_refractometry_incoherent_solve_nans_outside_ccd(self):
-        """Refractometry.incoherent_solve must NaN rays outside CCD in self.rf."""
-        # Wide-spread rays so some land outside the CCD
+        """
+        Refractometry.incoherent_solve must NaN rays whose input phi exceeds
+        the CCD angular acceptance, matching the ccd_cutoff_1d logic from
+        example 05.  phi_max is derived from the arrangement RTM.
+        """
         rng = np.random.RandomState(7)
         rf = np.zeros((4, 400))
-        rf[0] = (rng.rand(400) - 0.5) * 8e-3   # x ±4 mm
-        rf[2] = (rng.rand(400) - 0.5) * 8e-3   # y ±4 mm
-        rf[1] = rng.randn(400) * 2e-3
-        rf[3] = rng.randn(400) * 2e-3
+        rf[0] = (rng.rand(400) - 0.5) * 8e-3
+        rf[2] = (rng.rand(400) - 0.5) * 8e-3
+        rf[1] = rng.randn(400) * 30e-3   # ±30 mrad std — wide enough to exceed phi_max
+        rf[3] = rng.randn(400) * 30e-3
 
-        ccd = (9e-3, 7e-3)  # small CCD to guarantee rejections
+        ccd = (9e-3, 7e-3)
         diag = Refractometry(rf, L=400, R=500, Lx=50, Ly=50, ccd_shape_m=ccd)
         diag.incoherent_solve()
 
-        # Rays outside CCD must be NaN in self.rf
-        x_out = np.abs(diag.rf[0]) > ccd[0] * 1e3 / 2
-        y_out = np.abs(diag.rf[2]) > ccd[1] * 1e3 / 2
-        # Any ray flagged as out-of-bounds in detector coords should be NaN
-        # (some may already be NaN from apertures, which is fine)
-        outside_mask = x_out | y_out
-        # Check: no ray that is outside the CCD has a finite x position
-        assert not np.any(np.isfinite(diag.rf[0, outside_mask]) |
-                          np.isfinite(diag.rf[2, outside_mask])), \
-            "Rays outside CCD must be NaN in self.rf after incoherent_solve"
+        # Compute the same phi_max the filter used
+        B_y = diag._rtm_y[0, 1]
+        phi_max = (ccd[1] * 1e3 / 2) / abs(B_y)
+
+        # Rays with |phi_in| > phi_max must be NaN in self.rf
+        phi_in = rf[3]   # original input angles (radians)
+        outside = np.abs(phi_in) > phi_max
+        assert outside.any(), "Need some rays outside phi_max for this test"
+        assert np.all(np.isnan(diag.rf[0, outside])), \
+            "Rays with |phi| > phi_max must be NaN in self.rf"
 
     def test_refractometry_incoherent_custom_solve_nans_outside_ccd(self):
-        """Refractometry.incoherent_custom_solve must NaN rays outside CCD."""
+        """
+        Refractometry.incoherent_custom_solve must NaN rays outside the
+        CCD angular acceptance, analogous to ccd_cutoff_1d (example 05).
+        """
         rng = np.random.RandomState(13)
         rf = np.zeros((4, 400))
         rf[0] = (rng.rand(400) - 0.5) * 8e-3
         rf[2] = (rng.rand(400) - 0.5) * 8e-3
-        rf[1] = rng.randn(400) * 2e-3
-        rf[3] = rng.randn(400) * 2e-3
+        rf[1] = rng.randn(400) * 30e-3
+        rf[3] = rng.randn(400) * 30e-3
 
         ccd = (9e-3, 7e-3)
         diag = Refractometry(rf, L=400, R=500, Lx=50, Ly=50, ccd_shape_m=ccd)
         diag.incoherent_custom_solve()
 
-        x_out = np.abs(diag.rf[0]) > ccd[0] * 1e3 / 2
-        y_out = np.abs(diag.rf[2]) > ccd[1] * 1e3 / 2
-        outside_mask = x_out | y_out
-        assert not np.any(np.isfinite(diag.rf[0, outside_mask]) |
-                          np.isfinite(diag.rf[2, outside_mask])), \
-            "Rays outside CCD must be NaN after incoherent_custom_solve"
+        B_y = diag._rtm_y[0, 1]
+        phi_max = (ccd[1] * 1e3 / 2) / abs(B_y)
+
+        phi_in = rf[3]
+        outside = np.abs(phi_in) > phi_max
+        assert outside.any(), "Need some rays outside phi_max for this test"
+        assert np.all(np.isnan(diag.rf[0, outside])), \
+            "Rays with |phi| > phi_max must be NaN in self.rf"
 
     def test_refractometry_no_ccd_leaves_rf_unchanged_by_filter(self):
         """Without ccd_shape_m, _apply_ccd_filter_to_rf must be a no-op."""
@@ -1559,7 +1567,8 @@ class TestCCDAcceptance:
         diag_no_ccd.incoherent_solve()
         diag_ccd.incoherent_solve()
 
-        # diag_no_ccd must have at least as many finite rays as diag_ccd
+        # With a generous CCD, the no-CCD case should have at least as many
+        # finite rays (the filter can only reduce or leave unchanged).
         n_finite_no_ccd = np.isfinite(diag_no_ccd.rf[0]).sum()
         n_finite_ccd    = np.isfinite(diag_ccd.rf[0]).sum()
         assert n_finite_no_ccd >= n_finite_ccd, \

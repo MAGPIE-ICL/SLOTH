@@ -631,24 +631,48 @@ class Refractometry(Diagnostic):
 
     def _apply_ccd_filter_to_rf(self):
         """
-        NaN rays in ``self.rf`` that fall outside the CCD footprint.
+        Filter rays whose input angles fall outside the CCD acceptance range.
 
-        Applied at the end of each solve when ``ccd_shape_m`` was supplied
-        at construction time.  The CCD is treated as a rectangular aperture
-        centred on the optical axis: rays with ``|x| > Lx/2`` or
-        ``|y| > Ly/2`` (all in mm) are set to NaN, exactly as
-        :func:`circular_aperture` and :func:`rect_aperture` do for lenses.
+        Analogous to ``ccd_cutoff_1d`` in example 05: keeps only rays whose
+        measured angle (phi, theta) lies within the range derived from the
+        physical CCD size and the arrangement-specific RTM.
 
-        No-op when ``ccd_shape_m`` was not supplied (``_ccd_half_x_mm`` is
-        ``None``).
+        For each angular axis the bound is ``angle_max = CCD_half / |B|``
+        where *B* is the (0,1) element of the 2×2 RTM — the angle-to-detector-
+        position scale.  For pure imaging axes (B ≈ 0) no angular bound is
+        applied (the CCD does not constrain the input angle on an imaging axis).
+
+        Rays outside the acceptance range are NaN'd in ``self.rf``, consistent
+        with the ``circular_aperture`` / ``rect_aperture`` convention.
+
+        No-op when ``ccd_shape_m`` was not supplied.
         """
         if self._ccd_half_x_mm is None:
             return
-        outside = (
-            (np.abs(self.rf[0]) > self._ccd_half_x_mm) |
-            (np.abs(self.rf[2]) > self._ccd_half_y_mm)
-        )
-        self.rf[:, outside] = np.nan
+
+        # Input angles are rows 1 (theta) and 3 (phi) of r0.
+        # m_to_mm only scales position rows (0, 2), so angles are in radians.
+        theta = self.r0[1]
+        phi   = self.r0[3]
+
+        # Start with a finite-value mask — same as ccd_cutoff_1d with no bounds.
+        mask = np.isfinite(phi) & np.isfinite(theta)
+
+        # phi  (y-angular axis): apply bound derived from RTM B_y element.
+        if self._rtm_y is not None:
+            B_y = self._rtm_y[0, 1]
+            if abs(B_y) > 1e-12:
+                phi_max = self._ccd_half_y_mm / abs(B_y)  # rad
+                mask &= (phi >= -phi_max) & (phi <= phi_max)
+
+        # theta (x-angular axis): apply bound derived from RTM B_x element.
+        if self._rtm_x is not None:
+            B_x = self._rtm_x[0, 1]
+            if abs(B_x) > 1e-12:
+                theta_max = self._ccd_half_x_mm / abs(B_x)  # rad
+                mask &= (theta >= -theta_max) & (theta <= theta_max)
+
+        self.rf[:, ~mask] = np.nan
 
     def incoherent_custom_solve(self, f1 = 200, f3 = 200, img_f1_dist = 600, img_dist = 400):
         ##
