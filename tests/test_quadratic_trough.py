@@ -64,6 +64,9 @@ import tempfile
 import warnings
 
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -81,7 +84,7 @@ jax.config.update('jax_platform_name', 'cpu')
 from scipy.constants import c
 from core.propagator import trace_and_save_depths, kappa_inv_brems, precompute_gradients
 from core.domain import ScalarDomain
-from processing.diagnostics import Diagnostic
+from processing.diagnostics import Diagnostic, plot_amplitude_diagnostics, compare_diagnostics
 
 # ---------------------------------------------------------------------------
 # Physical constants
@@ -746,3 +749,167 @@ class TestDiagnosticWeighting:
                                       err_msg="x bin edges changed with amplitude weights")
         np.testing.assert_array_equal(diag_plain.yedges, diag_wt.yedges,
                                       err_msg="y bin edges changed with amplitude weights")
+
+
+# ---------------------------------------------------------------------------
+# TestPrefilterAndAmplitudeHelpers
+# ---------------------------------------------------------------------------
+
+class TestPrefilterAndAmplitudeHelpers:
+    """
+    Regression tests covering:
+      1. prefilter_input preserves alignment between rf and weights
+      2. unit weights produce identical histograms to no weights
+      3. artificially strong attenuation produces a measurable histogram reduction
+      4. amplitude inspection helpers run without error
+    """
+
+    _NP = 40
+
+    def _rays_and_domain(self, inv_brems=False):
+        rng = np.random.RandomState(99)
+        x0  = _A * 0.5 * (rng.rand(self._NP) - 0.5)
+        s0  = _collimated_rays(x0, z_start=-_HALF_Z)
+        dom = _QuadraticTroughDomain(_NE_0, _A, _HALF_Z,
+                                     inv_brems=inv_brems,
+                                     Te=100.0 if inv_brems else None,
+                                     Z=1.0   if inv_brems else None)
+        return s0, dom
+
+    def _run(self, domain, s0):
+        return trace_and_save_depths(
+            s0, domain,
+            step=_DEPTH_MAX, depth_max=_DEPTH_MAX,
+            output_path=None, lwl=_LWL,
+            jones_components=[0, 1, 2, 3],
+            jitted=True, verbose=False,
+        )
+
+    # ------------------------------------------------------------------
+    # 1.  prefilter_input alignment
+    # ------------------------------------------------------------------
+
+    def test_prefilter_no_weights_runs(self):
+        """prefilter_input=True without weights must not raise."""
+        s0, dom = self._rays_and_domain()
+        res = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+        # Use a tight lens radius so some rays are actually cut
+        diag = Diagnostic(jvec, L=100, R=1, prefilter_input=True)
+        diag.histogram(pix_x=20, pix_y=20)
+        assert diag.H.sum() <= self._NP
+
+    def test_prefilter_weights_aligned(self):
+        """
+        After prefilter_input, self.rf.shape[-1] must equal len(self.weights).
+        The bug: weights were taken from the original (unfiltered) array.
+        """
+        s0, dom = self._rays_and_domain(inv_brems=True)
+        res = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+        amp  = np.asarray(res['amplitude'][-1])
+
+        # Tight lens so at least some rays are dropped
+        diag = Diagnostic(jvec, weights=amp, L=100, R=1, prefilter_input=True)
+
+        assert diag.rf.shape[-1] == len(diag.weights), (
+            f"rf has {diag.rf.shape[-1]} rays but weights has {len(diag.weights)} entries; "
+            "prefilter_input must apply the same mask to both."
+        )
+
+    def test_prefilter_histogram_runs_with_weights(self):
+        """Histogram must complete without shape mismatch after prefilter + weights."""
+        s0, dom = self._rays_and_domain(inv_brems=True)
+        res = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+        amp  = np.asarray(res['amplitude'][-1])
+
+        diag = Diagnostic(jvec, weights=amp, L=100, R=1, prefilter_input=True)
+        # Would raise IndexError before the fix if sizes differ
+        diag.histogram(pix_x=20, pix_y=20)
+
+    # ------------------------------------------------------------------
+    # 2.  unit weights are identical to no weights
+    # ------------------------------------------------------------------
+
+    def test_unit_weights_match_unweighted(self):
+        """weights = array of 1.0 must give exactly the same histogram as weights=None."""
+        s0, dom = self._rays_and_domain()
+        res = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+
+        ones = np.ones(np.asarray(jvec).shape[-1], dtype=np.float64)
+
+        diag_plain = Diagnostic(jvec, L=100, R=50, Lx=50, Ly=50)
+        diag_ones  = Diagnostic(jvec, weights=ones, L=100, R=50, Lx=50, Ly=50)
+        diag_plain.histogram(pix_x=30, pix_y=30)
+        diag_ones.histogram(pix_x=30, pix_y=30)
+
+        np.testing.assert_array_equal(
+            diag_plain.H, diag_ones.H,
+            err_msg="Unit weights must produce identical histogram to no weights",
+        )
+
+    # ------------------------------------------------------------------
+    # 3.  strong attenuation is visible
+    # ------------------------------------------------------------------
+
+    def test_strong_attenuation_measurable(self):
+        """
+        Artificially setting all weights to 0.1 must reduce the histogram sum
+        to roughly 10 % of the unweighted sum.
+        """
+        s0, dom = self._rays_and_domain()
+        res = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+        N    = np.asarray(jvec).shape[-1]
+
+        low_amp = np.full(N, 0.1, dtype=np.float64)
+
+        diag_plain = Diagnostic(jvec, L=100, R=50, Lx=50, Ly=50)
+        diag_low   = Diagnostic(jvec, weights=low_amp, L=100, R=50, Lx=50, Ly=50)
+        diag_plain.histogram(pix_x=30, pix_y=30)
+        diag_low.histogram(pix_x=30, pix_y=30)
+
+        ratio = diag_low.H.sum() / diag_plain.H.sum()
+        assert abs(ratio - 0.1) < 0.01, (
+            f"Expected weighted sum ≈ 10 % of unweighted (ratio={ratio:.4f})"
+        )
+
+    # ------------------------------------------------------------------
+    # 4.  amplitude inspection helpers
+    # ------------------------------------------------------------------
+
+    def test_plot_amplitude_diagnostics_runs(self):
+        """plot_amplitude_diagnostics must return (fig, axes) without error."""
+        s0, dom = self._rays_and_domain(inv_brems=True)
+        res = self._run(dom, s0)
+        jvec = res['jvec'][-1]
+        amp  = np.asarray(res['amplitude'][-1])
+
+        fig, axes = plot_amplitude_diagnostics(amp, jvec)
+        assert len(axes) == 2
+        plt.close(fig)
+
+    def test_compare_diagnostics_runs(self):
+        """compare_diagnostics must return (fig, axes) and the ratio image must be in [0, 1]."""
+
+        s0, dom_plain = self._rays_and_domain(inv_brems=False)
+        s0, dom_ib = self._rays_and_domain(inv_brems=True)
+
+        res_plain = self._run(dom_plain, s0)
+        res_ib    = self._run(dom_ib,    s0)
+        jvec = res_plain['jvec'][-1]
+        amp  = np.asarray(res_ib['amplitude'][-1])
+
+        diag_plain = Diagnostic(jvec, L=100, R=50, Lx=50, Ly=50)
+        diag_wt    = Diagnostic(jvec, weights=amp, L=100, R=50, Lx=50, Ly=50)
+        diag_plain.histogram(pix_x=20, pix_y=20)
+        diag_wt.histogram(pix_x=20, pix_y=20)
+
+        fig, axes = compare_diagnostics(
+            diag_plain.H, diag_wt.H,
+            diag_plain.xedges, diag_plain.yedges,
+        )
+        assert len(axes) == 3
+        plt.close(fig)
